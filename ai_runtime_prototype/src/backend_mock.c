@@ -1,0 +1,75 @@
+#include "backend.h"
+
+#include <stddef.h>
+
+/* Mock backend gia lap shape cua traffic_qos_model (240 input, 5 output/
+ * class) de test flow application ma khong can QAIRT SDK. Day la fixture
+ * co dinh cho muc dich test nhanh, khong phai backend "generic" - neu doi
+ * model that thi dung backend qnn_cli/qnn_api, khong sua so o day. */
+#define MOCK_INPUT_COUNT 240
+#define MOCK_OUTPUT_COUNT 5
+
+static int g_backend_ready = 0;
+
+int backend_init(void)
+{
+    g_backend_ready = 1;
+    return 0;
+}
+
+int backend_get_io_count(int *input_count, int *output_count)
+{
+    if (!g_backend_ready) {
+        return -1;
+    }
+    if (input_count != NULL) {
+        *input_count = MOCK_INPUT_COUNT;
+    }
+    if (output_count != NULL) {
+        *output_count = MOCK_OUTPUT_COUNT;
+    }
+    return 0;
+}
+
+int backend_execute(const float *input, int input_count, float *output, int output_count)
+{
+    if (!g_backend_ready || input == NULL || output == NULL || input_count <= 0 || output_count < 5) {
+        return -1;
+    }
+
+    /* Mock output copied from the validated QNN CPU result. */
+    output[0] = 4.4335314e-04f;
+    output[1] = 2.2159459e-03f;
+    output[2] = 9.9732780e-01f;
+    output[3] = 1.2404647e-05f;
+    output[4] = 4.2676922e-07f;
+
+    return 0;
+}
+
+void backend_deinit(void)
+{
+    g_backend_ready = 0;
+}
+
+/* THEM MOI (dong bo voi backend.h/tflite_qnn_prototype): backend nay chua
+ * ho tro doc dtype dong (chi lam viec voi float32 tu truoc gio), nen tra
+ * ve -1 - ai_runtime.c se tu hieu la "khong ho tro", giu nguyen mac dinh
+ * DL_DTYPE_FLOAT32 va duong code cu (backend_execute()). KHONG doi hanh
+ * vi hien tai cua backend nay. */
+int backend_get_io_dtype(dl_tensor_dtype_t *input_dtype, float *input_scale, int *input_zero_point,
+                          dl_tensor_dtype_t *output_dtype, float *output_scale, int *output_zero_point)
+{
+    (void)input_dtype; (void)input_scale; (void)input_zero_point;
+    (void)output_dtype; (void)output_scale; (void)output_zero_point;
+    return -1;
+}
+
+/* Backend nay khong dung duong "raw" (chi co model float32) - khong bao
+ * gio duoc goi thuc te vi backend_get_io_dtype() da tra -1 o tren, nhung
+ * van dinh nghia de link OK. */
+int backend_execute_raw(const void *input, int input_count, void *output, int output_count)
+{
+    (void)input; (void)input_count; (void)output; (void)output_count;
+    return -1;
+}

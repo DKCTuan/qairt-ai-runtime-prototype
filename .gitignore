@@ -1,0 +1,30 @@
+# Qualcomm SDK và virtual environments
+qairt/
+*_env/
+venv/
+.venv/
+
+# Build artifacts
+**/build/
+*.o
+*.a
+*.so
+
+# Python cache
+**/__pycache__/
+*.pyc
+
+# Crash dumps
+*.core
+
+# Windows metadata
+*:Zone.Identifier
+
+# Archives
+*.zip
+
+# Generated model artifacts
+*.bin
+*.dlc
+*.raw
+*.npy
