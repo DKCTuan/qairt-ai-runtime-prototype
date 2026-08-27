@@ -43,11 +43,27 @@ def namespace_for_convert(body):
     return argparse.Namespace(
         qairt_root=body.get('qairt_root', str(model_deploy.DEFAULT_QAIRT_ROOT)),
         model=body['model'],
-        output=body['output'],
-        converter=body.get('converter', 'qairt'),
+        output=body.get('output'),
+        converter=body.get('converter', 'auto'),
         source_model_input_shape=body.get('source_model_input_shape'),
         out_tensor_node=body.get('out_tensor_node'),
         extra_args=body.get('extra_args', []),
+    )
+
+
+def namespace_for_prepare(body):
+    body = normalize_body(body)
+    return argparse.Namespace(
+        qairt_root=body.get('qairt_root', str(model_deploy.DEFAULT_QAIRT_ROOT)),
+        model=body['model'],
+        model_positional=None,
+        work_dir=body.get('work_dir'),
+        converter=body.get('converter', 'auto'),
+        source_model_input_shape=body.get('source_model_input_shape'),
+        out_tensor_node=body.get('out_tensor_node'),
+        extra_args=body.get('extra_args', []),
+        backend=body.get('backend', 'cpu'),
+        target=body.get('target', model_deploy.DEFAULT_TARGET),
     )
 
 
@@ -63,7 +79,7 @@ def namespace_for_deploy(body):
         target=body.get('target', 'x86_64-linux-clang'),
         model=body['model'],
         work_dir=body.get('work_dir', str(model_deploy.DEFAULT_WORK_ROOT / 'api_deploy')),
-        converter=body.get('converter', 'qairt'),
+        converter=body.get('converter', 'auto'),
         source_model_input_shape=body.get('source_model_input_shape'),
         out_tensor_node=body.get('out_tensor_node'),
         extra_args=body.get('extra_args', []),
@@ -151,6 +167,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(status, result)
             elif self.path == '/convert':
                 result = capture_json(model_deploy.command_convert, namespace_for_convert(body))
+                self._send(200, result)
+            elif self.path == '/prepare':
+                result = capture_json(model_deploy.command_prepare, namespace_for_prepare(body))
                 self._send(200, result)
             elif self.path == '/deploy':
                 result, exit_code = capture_json_allow_exit(model_deploy.command_deploy, namespace_for_deploy(body))

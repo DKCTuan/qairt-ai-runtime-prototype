@@ -36,10 +36,9 @@ DEPLOY_TOOL = REPO_ROOT / 'tools' / 'model_deploy.py'
 #   - doi duong dan model/input/reference tren may (vi du chuyen sang may
 #     khac, hoac doi vi tri luu model_test/)
 #
-# LUU Y: cac duong dan ben duoi la placeholder theo dung quy uoc da dung
-# trong scripts/*.sh (thu muc /home/congtuan/model_test/). Sua lai cho
-# khop thuc te truoc khi chay - script se bao loi ro rang neu file khong
-# ton tai, khong chay ngam.
+# Cac duong dan mac dinh khop bo model_test di kem workspace hien tai.
+# Co the override SDK/work root tu command line; khi chuyen bo test sang may
+# khac, sua cac fixture path o mot cho tai day.
 MODEL_CONFIGS = [
     {
         'name': 'traffic_qos_model',
@@ -57,8 +56,8 @@ MODEL_CONFIGS = [
     {
         'name': 'best_onnx_yolo',
         'model': '/home/congtuan/model_test/best.onnx',
-        'input_raw': '/home/congtuan/model_test/yolo_input.raw',
-        'reference': '/home/congtuan/model_test/yolo_reference_output.raw',
+        'input_raw': '/home/congtuan/model_test/yolo_test_input.raw',
+        'reference': '/home/congtuan/model_test/yolo_reference_output.npy',
         'backend': 'cpu',
         # YOLO co 1.23M param / 151.200 so output - sai so tich luy qua cac
         # lop se lon hon model nho, nen tolerance long hon la hop ly, khong

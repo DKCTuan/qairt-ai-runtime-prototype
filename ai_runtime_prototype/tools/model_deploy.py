@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_QAIRT_ROOT = Path('/home/congtuan/qairt_sdk/qairt/2.44.0.260225')
 DEFAULT_WORK_ROOT = Path('/tmp/model_deploy_tool')
 
 # Target triplet mac dinh = host x86_64. Cac lenh convert/run-host/validate
@@ -29,6 +28,29 @@ BACKEND_LIBS = {
     'gpu': 'libQnnGpu.so',
     'htp': 'libQnnHtp.so',
 }
+
+
+def discover_qairt_root() -> Path:
+    """Find the SDK without tying the tool to one user's home directory."""
+    for name in ('DL_QAIRT_ROOT', 'QAIRT_ROOT', 'QNN_SDK_ROOT'):
+        value = os.environ.get(name)
+        if value:
+            return Path(value).expanduser().resolve()
+
+    sdk_parent = Path(__file__).resolve().parents[2] / 'qairt'
+    if sdk_parent.is_dir():
+        candidates = sorted(
+            (path for path in sdk_parent.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0].resolve()
+
+    return Path('/home/congtuan/qairt_sdk/qairt/2.44.0.260225')
+
+
+DEFAULT_QAIRT_ROOT = discover_qairt_root()
 
 
 def fail(message: str, code: int = 1):
@@ -61,19 +83,25 @@ def qairt_paths(qairt_root: Path, target: str = DEFAULT_TARGET):
 
 
 def backend_lib_path(qairt_root: Path, target: str, backend: str):
-    lib_name = BACKEND_LIBS.get(backend, BACKEND_LIBS['cpu'])
+    try:
+        lib_name = BACKEND_LIBS[backend]
+    except KeyError:
+        fail(f'unsupported backend: {backend}; choose one of {", ".join(BACKEND_LIBS)}')
     return qairt_root / 'lib' / target / lib_name
 
 
 def run(cmd, env=None, cwd=None, log_path: Path | None = None):
     printable = ' '.join(str(x) for x in cmd)
     print(f'$ {printable}')
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open('w') as log:
-            proc = subprocess.run(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True)
-    else:
-        proc = subprocess.run(cmd, cwd=cwd, env=env, text=True)
+    try:
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open('w') as log:
+                proc = subprocess.run(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True)
+        else:
+            proc = subprocess.run(cmd, cwd=cwd, env=env, text=True)
+    except OSError as exc:
+        fail(f'cannot execute {cmd[0]}: {exc}')
     if proc.returncode != 0:
         if log_path is not None:
             fail(f'command failed, see log: {log_path}')
@@ -85,7 +113,10 @@ def run_capture(cmd, env=None, cwd=None):
     cho run-api de parse 'label=...'/'scores=...' tu traffic_app."""
     printable = ' '.join(str(x) for x in cmd)
     print(f'$ {printable}')
-    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    try:
+        return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    except OSError as exc:
+        fail(f'cannot execute {cmd[0]}: {exc}')
 
 
 def parse_traffic_app_output(text: str):
@@ -120,6 +151,20 @@ def parse_traffic_app_output(text: str):
     return label, scores, latency_ms
 
 
+def result_with_limited_scores(result: dict, limit: int = 100):
+    """Keep CLI/REST output bounded for detector models with huge tensors."""
+    printable = dict(result)
+    scores = printable.get('scores')
+    if isinstance(scores, list):
+        printable['score_count'] = len(scores)
+        if limit >= 0 and len(scores) > limit:
+            printable['scores'] = scores[:limit]
+            printable['scores_truncated'] = True
+        else:
+            printable['scores_truncated'] = False
+    return printable
+
+
 def make_env(qairt_root: Path, target: str = DEFAULT_TARGET):
     paths = qairt_paths(qairt_root, target)
     env = os.environ.copy()
@@ -139,25 +184,50 @@ def ensure_exists(path: Path, label: str):
 
 
 def qairt_python(qairt_root: Path):
-    python = qairt_root / 'qairt_env' / 'bin' / 'python'
-    ensure_file(python, 'QAIRT Python environment')
-    return python
+    bundled = qairt_root / 'qairt_env' / 'bin' / 'python'
+    if bundled.is_file():
+        return bundled
+    current = Path(sys.executable).resolve()
+    if current.is_file():
+        return current
+    fail(f'QAIRT Python environment not found below {qairt_root} and no current Python is usable')
+
+
+def model_from_args(args) -> Path:
+    value = getattr(args, 'model', None) or getattr(args, 'model_positional', None)
+    if not value:
+        fail('input model is required (use MODEL or --model MODEL)')
+    return Path(value).expanduser().resolve()
+
+
+def normalized_extra_args(values):
+    values = list(values or [])
+    return values[1:] if values[:1] == ['--'] else values
 
 
 def command_convert(args):
-    qairt_root = Path(args.qairt_root)
+    qairt_root = Path(args.qairt_root).expanduser().resolve()
     paths = qairt_paths(qairt_root)
-    model = Path(args.model).resolve()
-    output = Path(args.output).resolve()
-    ensure_exists(model, 'input model')
+    model = model_from_args(args)
+    ensure_file(model, 'input model')
+    output_value = getattr(args, 'output', None)
+    output = Path(output_value).expanduser().resolve() if output_value else model.with_suffix('.dlc')
     output.parent.mkdir(parents=True, exist_ok=True)
 
     ext = model.suffix.lower()
 
     if ext == '.dlc':
-        shutil.copy2(model, output)
-        print(json.dumps({'status': 'success', 'dlc_path': str(output), 'mode': 'copy'}, indent=2))
-        return
+        if model != output:
+            shutil.copy2(model, output)
+            mode = 'copy'
+        else:
+            mode = 'reuse'
+        result = {'status': 'success', 'dlc_path': str(output), 'mode': mode}
+        print(json.dumps(result, indent=2))
+        return result
+
+    if ext not in ('.onnx', '.tflite'):
+        fail(f'unsupported input model extension: {ext or "<none>"}; expected .onnx, .tflite or .dlc')
 
     # Chi resolve QAIRT python env khi thuc su can converter (input khong
     # phai .dlc) - truoc day goi ham nay vo dieu kien nen lenh convert/deploy
@@ -202,17 +272,18 @@ def command_convert(args):
         for name in args.out_tensor_node:
             cmd.extend(['--out_tensor_node', name])
 
-    if args.extra_args:
-        cmd.extend(args.extra_args)
+    cmd.extend(normalized_extra_args(getattr(args, 'extra_args', [])))
 
     log_path = output.with_suffix('.convert.log')
     run(cmd, env=env, log_path=log_path)
-    print(json.dumps({
+    result = {
         'status': 'success',
         'converter': converter,
         'dlc_path': str(output),
         'log_path': str(log_path),
-    }, indent=2))
+    }
+    print(json.dumps(result, indent=2))
+    return result
 def write_input_list(input_name: str, input_raw: Path, input_list: Path):
     input_list.write_text(f'{input_name}:={input_raw}\n')
 
@@ -261,7 +332,8 @@ def command_run_host(args):
     scores = read_float32(output_raw)
     label = max(range(len(scores)), key=lambda i: scores[i]) if scores else -1
     result = {'status': 'success', 'label': label, 'scores': scores, 'output_raw': str(output_raw), 'log_path': str(log_path)}
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result_with_limited_scores(
+        result, getattr(args, 'max_print_scores', 100)), indent=2))
     return result
 
 
@@ -369,6 +441,9 @@ def command_run_api(args):
     tra ve label/scores parse tu stdout cua application."""
     qairt_root = Path(args.qairt_root)
     target = args.target
+    if target != DEFAULT_TARGET:
+        fail('run-api executes traffic_app locally and currently supports only '
+             f'{DEFAULT_TARGET}; use prepare to build artifacts for another device target')
     repo_root = Path(__file__).resolve().parent.parent
     context_bin = Path(args.context).resolve()
     input_raw = Path(args.input_raw).resolve()
@@ -382,7 +457,11 @@ def command_run_api(args):
     work_dir = Path(args.work_dir).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    make_cmd = ['make', 'BACKEND=qnn_api', f'DL_QAIRT_ROOT={qairt_root}']
+    build_dir = work_dir / 'build'
+    make_cmd = [
+        'make', 'BACKEND=qnn_api', f'DL_QAIRT_ROOT={qairt_root}',
+        f'BUILD_DIR={build_dir}',
+    ]
     if args.cc:
         make_cmd.append(f'CC={args.cc}')
     if args.ar:
@@ -392,7 +471,7 @@ def command_run_api(args):
     make_log = work_dir / 'make.log'
     run(make_cmd, cwd=repo_root, log_path=make_log)
 
-    app_path = repo_root / 'build' / 'qnn_api' / 'traffic_app'
+    app_path = build_dir / 'traffic_app'
     ensure_file(app_path, 'traffic_app (qnn_api build)')
 
     env = os.environ.copy()
@@ -424,6 +503,46 @@ def command_run_api(args):
         'backend': args.backend,
         'target': target,
         'log_path': str(app_log),
+    }
+    print(json.dumps(result_with_limited_scores(
+        result, getattr(args, 'max_print_scores', 100)), indent=2))
+    return result
+
+
+def command_prepare(args):
+    """Minimal model -> DLC -> context-binary workflow, without inference."""
+    qairt_root = Path(args.qairt_root).expanduser().resolve()
+    model = model_from_args(args)
+    ensure_file(model, 'input model')
+
+    work_dir_value = getattr(args, 'work_dir', None)
+    work_dir = (Path(work_dir_value).expanduser().resolve() if work_dir_value
+                else (DEFAULT_WORK_ROOT / model.stem).resolve())
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    dlc_path = work_dir / f'{model.stem}.dlc'
+    convert_result = command_convert(argparse.Namespace(
+        qairt_root=str(qairt_root), model=str(model), model_positional=None,
+        output=str(dlc_path), converter=args.converter,
+        source_model_input_shape=args.source_model_input_shape,
+        out_tensor_node=args.out_tensor_node,
+        extra_args=normalized_extra_args(args.extra_args),
+    ))
+
+    context_path = work_dir / f'{model.stem}.{args.backend}.bin'
+    context_result = command_build_context(argparse.Namespace(
+        qairt_root=str(qairt_root), dlc=convert_result['dlc_path'],
+        output=str(context_path), backend=args.backend, target=args.target,
+    ))
+
+    result = {
+        'status': 'success',
+        'source_model': str(model),
+        'dlc_path': convert_result['dlc_path'],
+        'context_bin': context_result['context_bin'],
+        'backend': args.backend,
+        'target': args.target,
+        'work_dir': str(work_dir),
     }
     print(json.dumps(result, indent=2))
     return result
@@ -515,14 +634,16 @@ def command_deploy(args):
         if not passed:
             raise SystemExit(2)
     else:
-        print(json.dumps({
+        result = {
             'status': 'success',
             'dlc_path': str(dlc_path),
             'context_bin': str(context_bin_path),
             'label': run_result['label'],
             'scores': run_result['scores'],
             'latency_ms': run_result.get('latency_ms'),
-        }, indent=2))
+        }
+        print(json.dumps(result_with_limited_scores(
+            result, getattr(args, 'max_print_scores', 100)), indent=2))
 
 
 def build_parser():
@@ -530,14 +651,30 @@ def build_parser():
     parser.add_argument('--qairt-root', default=str(DEFAULT_QAIRT_ROOT))
     sub = parser.add_subparsers(dest='command', required=True)
 
-    p = sub.add_parser('convert', help='Convert source model to QAIRT/QNN deployable artifact')
-    p.add_argument('--model', required=True)
-    p.add_argument('--output', required=True)
-    p.add_argument('--converter', choices=['auto', 'qairt', 'qnn', 'snpe'], default='qairt')
+    p = sub.add_parser('convert', help='Convert MODEL to .dlc; output defaults next to MODEL')
+    p.add_argument('model_positional', nargs='?', metavar='MODEL')
+    p.add_argument('--model', help='Backward-compatible alternative to positional MODEL')
+    p.add_argument('-o', '--output', default=None)
+    p.add_argument('--converter', choices=['auto', 'qairt', 'qnn', 'snpe'], default='auto')
     p.add_argument('--source-model-input-shape', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'))
     p.add_argument('--out-tensor-node', action='append')
-    p.add_argument('extra_args', nargs=argparse.REMAINDER)
+    p.add_argument('--extra-args', nargs=argparse.REMAINDER, default=[],
+                   help='Arguments passed verbatim to the Qualcomm converter; place this option last')
     p.set_defaults(func=command_convert)
+
+    p = sub.add_parser('prepare', help='One command: MODEL -> .dlc + QNN context .bin')
+    p.add_argument('model_positional', nargs='?', metavar='MODEL')
+    p.add_argument('--model', help='Backward-compatible alternative to positional MODEL')
+    p.add_argument('-d', '--work-dir', default=None,
+                   help='Output directory (default: /tmp/model_deploy_tool/<model-name>)')
+    p.add_argument('--converter', choices=['auto', 'qairt', 'qnn', 'snpe'], default='auto')
+    p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
+    p.add_argument('--target', default=DEFAULT_TARGET)
+    p.add_argument('--source-model-input-shape', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'))
+    p.add_argument('--out-tensor-node', action='append')
+    p.add_argument('--extra-args', nargs=argparse.REMAINDER, default=[],
+                   help='Arguments passed verbatim to the Qualcomm converter; place this option last')
+    p.set_defaults(func=command_prepare)
 
     p = sub.add_parser('run-host', help='Run a DLC using QNN CPU backend on host')
     p.add_argument('--dlc', required=True)
@@ -575,22 +712,20 @@ def build_parser():
     p.add_argument('--input-raw', required=True)
     p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
     p.add_argument('--target', default=DEFAULT_TARGET,
-                    help='QAIRT target triplet cho runtime .so ma traffic_app se dlopen. '
-                         'Doi thanh target triplet cua device (vi du aarch64-oe-linux-gcc11.2) '
-                         'khi build de chay tren device that; nhung ban than tool nay chi thuc thi '
-                         'traffic_app CUC BO, nen neu target khac kien truc may dang chay tool nay, '
-                         'phai tu day artifact + chay tren device (adb/scp) - chua tu dong hoa buoc do.')
+                    help=f'Local runtime SDK target; currently only {DEFAULT_TARGET} is executable')
     p.add_argument('--graph-name', default=None)
     p.add_argument('--work-dir', default=str(DEFAULT_WORK_ROOT / 'run_api_work'))
     p.add_argument('--cc', default=None, help='Override CC (vi du toolchain cross-compile)')
     p.add_argument('--ar', default=None, help='Override AR (vi du toolchain cross-compile)')
+    p.add_argument('--max-print-scores', type=int, default=100,
+                   help='Maximum scores emitted in JSON; validation still uses the full tensor')
     p.set_defaults(func=command_run_api)
 
     p = sub.add_parser('deploy', help='Chain convert -> build-context -> run-api (+ so sanh reference neu co)')
     p.add_argument('--model', required=True)
     p.add_argument('--input-raw', required=True)
     p.add_argument('--reference', default=None)
-    p.add_argument('--converter', choices=['auto', 'qairt', 'qnn', 'snpe'], default='qairt')
+    p.add_argument('--converter', choices=['auto', 'qairt', 'qnn', 'snpe'], default='auto')
     p.add_argument('--source-model-input-shape', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'))
     p.add_argument('--out-tensor-node', action='append')
     p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
@@ -600,7 +735,10 @@ def build_parser():
     p.add_argument('--cc', default=None)
     p.add_argument('--ar', default=None)
     p.add_argument('--tolerance', type=float, default=1e-5)
-    p.add_argument('extra_args', nargs=argparse.REMAINDER)
+    p.add_argument('--max-print-scores', type=int, default=100,
+                   help='Maximum scores emitted in JSON; validation still uses the full tensor')
+    p.add_argument('--extra-args', nargs=argparse.REMAINDER, default=[],
+                   help='Arguments passed verbatim to the Qualcomm converter; place this option last')
     p.set_defaults(func=command_deploy)
 
     return parser

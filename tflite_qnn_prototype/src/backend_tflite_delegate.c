@@ -464,13 +464,15 @@ int backend_execute_raw(const void *input, int input_count, void *output, int ou
 
 void backend_deinit(void)
 {
-    if (g_delegate != NULL) {
-        TfLiteExternalDelegateDelete(g_delegate);
-        g_delegate = NULL;
-    }
     if (g_interpreter != NULL) {
         TfLiteInterpreterDelete(g_interpreter);
         g_interpreter = NULL;
+    }
+    /* The interpreter may still refer to delegate-owned state, so destroy
+     * it before destroying the delegate. */
+    if (g_delegate != NULL) {
+        TfLiteExternalDelegateDelete(g_delegate);
+        g_delegate = NULL;
     }
     if (g_interp_options != NULL) {
         TfLiteInterpreterOptionsDelete(g_interp_options);

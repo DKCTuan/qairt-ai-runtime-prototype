@@ -253,8 +253,10 @@ static int read_io_tensors_from_binary_info(const void *binary_buffer, uint64_t 
         graph_outputs = target_graph->graphInfoV1.graphOutputs;
     }
 
-    if (num_inputs < 1 || num_outputs < 1) {
-        fprintf(stderr, "backend_qnn_api: graph has no input/output tensors\n");
+    if (num_inputs != 1 || num_outputs != 1) {
+        fprintf(stderr, "backend_qnn_api: this runtime supports exactly 1 input and 1 output "
+                        "(model has %u input(s), %u output(s))\n",
+                num_inputs, num_outputs);
         return -1;
     }
 
@@ -263,6 +265,17 @@ static int read_io_tensors_from_binary_info(const void *binary_buffer, uint64_t 
      * backend_deinit(), khong duoc free som. */
     g_input_tensor  = graph_inputs[0];
     g_output_tensor = graph_outputs[0];
+
+    /* backend_execute() exposes float buffers. Refuse quantized contexts
+     * explicitly instead of passing incorrectly sized buffers to QNN. */
+    if (g_input_tensor.v1.dataType != QNN_DATATYPE_FLOAT_32 ||
+        g_output_tensor.v1.dataType != QNN_DATATYPE_FLOAT_32) {
+        fprintf(stderr, "backend_qnn_api: only FLOAT_32 tensors are supported "
+                        "(input=0x%x, output=0x%x)\n",
+                (unsigned)g_input_tensor.v1.dataType,
+                (unsigned)g_output_tensor.v1.dataType);
+        return -1;
+    }
 
     return 0;
 }
