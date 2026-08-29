@@ -159,6 +159,7 @@ static int create_plain_interpreter(void)
 
 int backend_init(void)
 {
+    g_fallback_reason = NULL;
     const char *model_path   = env_or_default("DL_TFLITE_MODEL_PATH", DEFAULT_TFLITE_MODEL);
     const char *delegate_lib = env_or_default("DL_QNN_DELEGATE_LIB", DEFAULT_QNN_DELEGATE_LIB);
     const char *backend_lib  = env_or_default("DL_QNN_BACKEND_LIB", DEFAULT_QNN_BACKEND_LIB);
@@ -339,6 +340,37 @@ int backend_get_io_count(int *input_count, int *output_count)
     return 0;
 }
 
+int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info)
+{
+    if (!g_backend_ready || index != 0 || info == NULL) return -1;
+    const TfLiteTensor *tensor = is_input
+        ? TfLiteInterpreterGetInputTensor(g_interpreter, index)
+        : TfLiteInterpreterGetOutputTensor(g_interpreter, index);
+    if (tensor == NULL) return -1;
+
+    memset(info, 0, sizeof(*info));
+    const char *name = TfLiteTensorName(tensor);
+    snprintf(info->name, sizeof(info->name), "%s", name != NULL ? name : (is_input ? "input_0" : "output_0"));
+    info->dtype = map_tflite_type(TfLiteTensorType(tensor));
+    if (info->dtype == DL_DTYPE_FLOAT32 && TfLiteTensorType(tensor) != kTfLiteFloat32) return -1;
+    info->rank = TfLiteTensorNumDims(tensor);
+    if (info->rank < 0 || info->rank > DL_MAX_TENSOR_RANK) return -1;
+    size_t count = 1;
+    for (int i = 0; i < info->rank; ++i) {
+        int dim = TfLiteTensorDim(tensor, i);
+        if (dim <= 0) return -1;
+        info->dimensions[i] = (uint32_t)dim;
+        count *= (size_t)dim;
+    }
+    info->element_count = count;
+    info->byte_size = TfLiteTensorByteSize(tensor);
+    TfLiteQuantizationParams quant = TfLiteTensorQuantizationParams(tensor);
+    info->scale = info->dtype == DL_DTYPE_FLOAT32 ? 1.0f : quant.scale;
+    info->zero_point = info->dtype == DL_DTYPE_FLOAT32 ? 0 : quant.zero_point;
+    info->quantized_axis = -1;
+    return 0;
+}
+
 int backend_get_io_dtype(dl_tensor_dtype_t *input_dtype, float *input_scale, int *input_zero_point,
                           dl_tensor_dtype_t *output_dtype, float *output_scale, int *output_zero_point)
 {
@@ -485,4 +517,5 @@ void backend_deinit(void)
 
     g_backend_ready = 0;
     g_using_delegate = 0;
+    g_fallback_reason = NULL;
 }

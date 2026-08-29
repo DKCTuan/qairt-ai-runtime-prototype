@@ -6,6 +6,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 DEFAULT_WORK_ROOT = Path('/tmp/model_deploy_tool')
@@ -77,6 +78,7 @@ def qairt_paths(qairt_root: Path, target: str = DEFAULT_TARGET):
         'qairt_converter': bin_dir / 'qairt-converter',
         'qnn_onnx_converter': bin_dir / 'qnn-onnx-converter',
         'qnn_tflite_converter': bin_dir / 'qnn-tflite-converter',
+        'qnn_pytorch_converter': bin_dir / 'qnn-pytorch-converter',
         'snpe_onnx_to_dlc': bin_dir / 'snpe-onnx-to-dlc',
         'snpe_tflite_to_dlc': bin_dir / 'snpe-tflite-to-dlc',
     }
@@ -205,6 +207,81 @@ def normalized_extra_args(values):
     return values[1:] if values[:1] == ['--'] else values
 
 
+def command_doctor(args):
+    """Read-only preflight before spending time converting or deploying a model."""
+    qairt_root = Path(args.qairt_root).expanduser().resolve()
+    paths = qairt_paths(qairt_root, args.target)
+    checks = []
+
+    def check(name, path, file_expected=True, required=True, hint=None):
+        path = Path(path)
+        ok = path.is_file() if file_expected else path.is_dir()
+        item = {'name': name, 'path': str(path), 'required': required, 'ok': ok}
+        if hint:
+            item['hint'] = hint
+        checks.append(item)
+
+    check('QAIRT root', qairt_root, file_expected=False)
+    check('target bin directory', paths['bin'], file_expected=False)
+    check('target lib directory', paths['lib'], file_expected=False)
+    check('qairt-converter', paths['qairt_converter'])
+    check('qnn-context-binary-generator', paths['qnn_context_binary_generator'])
+    check('qnn-net-run', paths['qnn_net_run'])
+    check('libQnnSystem.so', paths['qnn_system'])
+    check('libQnnModelDlc.so', paths['qnn_model_dlc'])
+    check(f'libQnn{args.backend.capitalize()}.so',
+          backend_lib_path(qairt_root, args.target, args.backend))
+
+    if args.model:
+        model = Path(args.model).expanduser().resolve()
+        check('input model', model)
+        extension = model.suffix.lower()
+        if extension == '.onnx':
+            check('qnn-onnx-converter', paths['qnn_onnx_converter'], required=False)
+        elif extension == '.tflite':
+            check('qnn-tflite-converter', paths['qnn_tflite_converter'], required=False)
+        elif extension in ('.pt', '.pth'):
+            check('qnn-pytorch-converter', paths['qnn_pytorch_converter'])
+            is_torchscript = model.is_file() and is_torchscript_archive(model)
+            checks.append({
+                'name': 'TorchScript archive', 'path': str(model), 'required': True,
+                'ok': is_torchscript,
+                'hint': 'export a training checkpoint with torch.jit.trace/script before conversion',
+            })
+        elif extension != '.dlc':
+            checks.append({
+                'name': 'supported model extension', 'path': extension or '<none>', 'required': True,
+                'ok': False, 'hint': 'use ONNX, TFLite, TorchScript .pt/.pth, or DLC',
+            })
+
+    missing = [item for item in checks if item['required'] and not item['ok']]
+    warnings = []
+    if args.target != DEFAULT_TARGET:
+        warnings.append('This target can be prepared, but run-api executes only local x86_64 binaries. '
+                        'Copy artifacts and run them on the matching device.')
+    if args.backend == 'htp':
+        warnings.append('HTP preflight cannot validate the target SoC, firmware, skeleton library, or graph partition. '
+                        'Validate those on the physical Qualcomm device.')
+    result = {
+        'status': 'ready' if not missing else 'not_ready',
+        'qairt_root': str(qairt_root), 'target': args.target, 'backend': args.backend,
+        'checks': checks, 'warnings': warnings,
+    }
+    print(json.dumps(result, indent=2))
+    if missing:
+        raise SystemExit(2)
+    return result
+
+
+def is_torchscript_archive(path: Path) -> bool:
+    """TorchScript archives contain compiled graph code; state_dict checkpoints do not."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return any('/code/' in name or name.startswith('code/') for name in archive.namelist())
+    except zipfile.BadZipFile:
+        return False
+
+
 def command_convert(args):
     qairt_root = Path(args.qairt_root).expanduser().resolve()
     paths = qairt_paths(qairt_root)
@@ -226,8 +303,9 @@ def command_convert(args):
         print(json.dumps(result, indent=2))
         return result
 
-    if ext not in ('.onnx', '.tflite'):
-        fail(f'unsupported input model extension: {ext or "<none>"}; expected .onnx, .tflite or .dlc')
+    if ext not in ('.onnx', '.tflite', '.pt', '.pth'):
+        fail(f'unsupported input model extension: {ext or "<none>"}; expected .onnx, .tflite, '
+             '.pt/.pth TorchScript, or .dlc')
 
     # Chi resolve QAIRT python env khi thuc su can converter (input khong
     # phai .dlc) - truoc day goi ham nay vo dieu kien nen lenh convert/deploy
@@ -238,9 +316,12 @@ def command_convert(args):
     converter = args.converter
 
     if converter == 'auto':
-        converter = 'qairt'
+        converter = 'qnn' if ext in ('.pt', '.pth') else 'qairt'
 
     if converter == 'qairt':
+        if ext in ('.pt', '.pth'):
+            fail('qairt-converter does not accept a PyTorch checkpoint here; use --converter qnn '
+                 'with a TorchScript model, or export the model to ONNX first')
         ensure_file(paths['qairt_converter'], 'qairt-converter')
         cmd = [python, paths['qairt_converter'], '--input_network', model, '--output_path', output]
     elif converter == 'snpe':
@@ -259,6 +340,19 @@ def command_convert(args):
         elif ext == '.tflite':
             ensure_file(paths['qnn_tflite_converter'], 'qnn-tflite-converter')
             cmd = [python, paths['qnn_tflite_converter'], '--input_network', model, '--output_path', output]
+        elif ext in ('.pt', '.pth'):
+            if not is_torchscript_archive(model):
+                fail('PyTorch file is not a TorchScript archive. A training checkpoint/state_dict cannot '
+                     'be converted by itself: load it with the original model class, then export via '
+                     'torch.jit.trace/script or torch.onnx.export. See README: PyTorch export.')
+            ensure_file(paths['qnn_pytorch_converter'], 'qnn-pytorch-converter')
+            input_dims = getattr(args, 'pytorch_input_dim', None) or []
+            if not input_dims:
+                fail('PyTorch conversion requires --pytorch-input-dim INPUT_NAME DIMS, for example '
+                     '--pytorch-input-dim input 1,240')
+            cmd = [python, paths['qnn_pytorch_converter'], '--input_network', model, '--output_path', output]
+            for item in input_dims:
+                cmd.extend(['--input_dim', item[0], item[1]])
         else:
             fail(f'qnn converter only supports .onnx/.tflite in this prototype, got: {ext}')
     else:
@@ -266,7 +360,8 @@ def command_convert(args):
 
     if args.source_model_input_shape:
         for item in args.source_model_input_shape:
-            cmd.extend(['--source_model_input_shape', item[0], item[1]])
+            if ext not in ('.pt', '.pth'):
+                cmd.extend(['--source_model_input_shape', item[0], item[1]])
 
     if args.out_tensor_node:
         for name in args.out_tensor_node:
@@ -525,6 +620,7 @@ def command_prepare(args):
         qairt_root=str(qairt_root), model=str(model), model_positional=None,
         output=str(dlc_path), converter=args.converter,
         source_model_input_shape=args.source_model_input_shape,
+        pytorch_input_dim=getattr(args, 'pytorch_input_dim', None),
         out_tensor_node=args.out_tensor_node,
         extra_args=normalized_extra_args(args.extra_args),
     ))
@@ -568,6 +664,7 @@ def command_deploy(args):
         output=str(dlc_path),
         converter=args.converter,
         source_model_input_shape=args.source_model_input_shape,
+        pytorch_input_dim=getattr(args, 'pytorch_input_dim', None),
         out_tensor_node=args.out_tensor_node,
         extra_args=args.extra_args or [],
     )
@@ -651,12 +748,20 @@ def build_parser():
     parser.add_argument('--qairt-root', default=str(DEFAULT_QAIRT_ROOT))
     sub = parser.add_subparsers(dest='command', required=True)
 
+    p = sub.add_parser('doctor', help='Check SDK, converter, backend and target prerequisites')
+    p.add_argument('model', nargs='?', metavar='MODEL')
+    p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
+    p.add_argument('--target', default=DEFAULT_TARGET)
+    p.set_defaults(func=command_doctor)
+
     p = sub.add_parser('convert', help='Convert MODEL to .dlc; output defaults next to MODEL')
     p.add_argument('model_positional', nargs='?', metavar='MODEL')
     p.add_argument('--model', help='Backward-compatible alternative to positional MODEL')
     p.add_argument('-o', '--output', default=None)
     p.add_argument('--converter', choices=['auto', 'qairt', 'qnn', 'snpe'], default='auto')
     p.add_argument('--source-model-input-shape', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'))
+    p.add_argument('--pytorch-input-dim', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'),
+                   help='Required for .pt/.pth TorchScript input, e.g. input 1,240')
     p.add_argument('--out-tensor-node', action='append')
     p.add_argument('--extra-args', nargs=argparse.REMAINDER, default=[],
                    help='Arguments passed verbatim to the Qualcomm converter; place this option last')
@@ -671,6 +776,7 @@ def build_parser():
     p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
     p.add_argument('--target', default=DEFAULT_TARGET)
     p.add_argument('--source-model-input-shape', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'))
+    p.add_argument('--pytorch-input-dim', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'))
     p.add_argument('--out-tensor-node', action='append')
     p.add_argument('--extra-args', nargs=argparse.REMAINDER, default=[],
                    help='Arguments passed verbatim to the Qualcomm converter; place this option last')
@@ -727,6 +833,7 @@ def build_parser():
     p.add_argument('--reference', default=None)
     p.add_argument('--converter', choices=['auto', 'qairt', 'qnn', 'snpe'], default='auto')
     p.add_argument('--source-model-input-shape', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'))
+    p.add_argument('--pytorch-input-dim', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'))
     p.add_argument('--out-tensor-node', action='append')
     p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
     p.add_argument('--target', default=DEFAULT_TARGET)

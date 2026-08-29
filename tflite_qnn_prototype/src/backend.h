@@ -1,6 +1,8 @@
 #ifndef BACKEND_H
 #define BACKEND_H
 
+#include "ai_runtime.h"
+
 int backend_init(void);
 
 /* Tra ve so luong phan tu (float) cua input/output tensor cua model dang
@@ -11,6 +13,7 @@ int backend_init(void);
  * env var - xem comment trong tung file backend_*.c.
  * Return 0 neu thanh cong, -1 neu that bai. */
 int backend_get_io_count(int *input_count, int *output_count);
+int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info);
 
 int backend_execute(const float *input, int input_count, float *output, int output_count);
 void backend_deinit(void);
@@ -23,17 +26,8 @@ void backend_deinit(void);
  * nhanh tren NPU/HTP) dung UINT8/INT8 cho input/output, kem theo tham so
  * quantization (scale, zero_point) de doi ve gia tri thuc.
  *
- * Cac ham duoi day la MO RONG, khong bat buoc: backend nao chua ho tro
- * (mock, qnn_cli, qnn_api hien tai) co the KHONG dinh nghia chung - phia
- * ai_runtime.c se goi backend_get_io_dtype() truoc, neu backend khong co
- * ham nay (hoac tra ve -1) thi mac dinh coi la DL_DTYPE_FLOAT32, dung
- * nguyen duong code cu (backend_execute) - hanh vi cu KHONG doi. */
-
-typedef enum {
-    DL_DTYPE_FLOAT32 = 0,
-    DL_DTYPE_UINT8   = 1,
-    DL_DTYPE_INT8    = 2
-} dl_tensor_dtype_t;
+ * Moi backend phai dinh nghia cac ham mo rong. Backend float32 co the tra
+ * metadata float32 va cho backend_execute_raw() forward ve backend_execute(). */
 
 /* Tra ve dtype that + tham so quantization (chi co y nghia neu dtype la
  * UINT8/INT8) cua input va output tensor. Model khong quantize (float32

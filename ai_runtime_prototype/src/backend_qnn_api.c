@@ -266,17 +266,6 @@ static int read_io_tensors_from_binary_info(const void *binary_buffer, uint64_t 
     g_input_tensor  = graph_inputs[0];
     g_output_tensor = graph_outputs[0];
 
-    /* backend_execute() exposes float buffers. Refuse quantized contexts
-     * explicitly instead of passing incorrectly sized buffers to QNN. */
-    if (g_input_tensor.v1.dataType != QNN_DATATYPE_FLOAT_32 ||
-        g_output_tensor.v1.dataType != QNN_DATATYPE_FLOAT_32) {
-        fprintf(stderr, "backend_qnn_api: only FLOAT_32 tensors are supported "
-                        "(input=0x%x, output=0x%x)\n",
-                (unsigned)g_input_tensor.v1.dataType,
-                (unsigned)g_output_tensor.v1.dataType);
-        return -1;
-    }
-
     return 0;
 }
 
@@ -385,6 +374,51 @@ static int tensor_element_count(const Qnn_Tensor_t *tensor)
     return (int)count;
 }
 
+static dl_tensor_dtype_t map_qnn_dtype(Qnn_DataType_t dtype)
+{
+    switch (dtype) {
+        case QNN_DATATYPE_FLOAT_32: return DL_DTYPE_FLOAT32;
+        case QNN_DATATYPE_UINT_8:
+        case QNN_DATATYPE_UFIXED_POINT_8: return DL_DTYPE_UINT8;
+        case QNN_DATATYPE_INT_8:
+        case QNN_DATATYPE_SFIXED_POINT_8: return DL_DTYPE_INT8;
+        default: return DL_DTYPE_UNKNOWN;
+    }
+}
+
+static size_t dtype_size(dl_tensor_dtype_t dtype)
+{
+    return dtype == DL_DTYPE_FLOAT32 ? sizeof(float) :
+           (dtype == DL_DTYPE_UINT8 || dtype == DL_DTYPE_INT8 ? 1u : 0u);
+}
+
+static int qnn_tensor_info(const Qnn_Tensor_t *tensor, dl_tensor_info_t *info)
+{
+    if (tensor == NULL || info == NULL || tensor->v1.rank > DL_MAX_TENSOR_RANK) return -1;
+    int count = tensor_element_count(tensor);
+    dl_tensor_dtype_t dtype = map_qnn_dtype(tensor->v1.dataType);
+    size_t element_size = dtype_size(dtype);
+    if (count <= 0 || element_size == 0) return -1;
+
+    memset(info, 0, sizeof(*info));
+    snprintf(info->name, sizeof(info->name), "%s", tensor->v1.name != NULL ? tensor->v1.name : "tensor");
+    info->dtype = dtype;
+    info->rank = (int)tensor->v1.rank;
+    for (uint32_t i = 0; i < tensor->v1.rank; ++i) info->dimensions[i] = tensor->v1.dimensions[i];
+    info->element_count = (size_t)count;
+    info->byte_size = (size_t)count * element_size;
+    info->scale = 1.0f;
+    info->quantized_axis = -1;
+    if (tensor->v1.quantizeParams.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET) {
+        info->scale = tensor->v1.quantizeParams.scaleOffsetEncoding.scale;
+        info->zero_point = -tensor->v1.quantizeParams.scaleOffsetEncoding.offset;
+    } else if (dtype != DL_DTYPE_FLOAT32) {
+        fprintf(stderr, "backend_qnn_api: only per-tensor scale/offset quantization is supported\n");
+        return -1;
+    }
+    return 0;
+}
+
 /* ---- backend.h interface -------------------------------------------- */
 
 int backend_init(void)
@@ -461,6 +495,12 @@ int backend_get_io_count(int *input_count, int *output_count)
     return 0;
 }
 
+int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info)
+{
+    if (!g_backend_ready || index != 0) return -1;
+    return qnn_tensor_info(is_input ? &g_input_tensor : &g_output_tensor, info);
+}
+
 int backend_execute(const float *input, int input_count, float *output, int output_count)
 {
     if (!g_backend_ready || input == NULL || output == NULL) {
@@ -526,24 +566,41 @@ void backend_deinit(void)
 
     g_backend_ready = 0;
 }
-/* THEM MOI (dong bo voi backend.h/tflite_qnn_prototype): backend nay chua
- * ho tro doc dtype dong (chi lam viec voi float32 tu truoc gio), nen tra
- * ve -1 - ai_runtime.c se tu hieu la "khong ho tro", giu nguyen mac dinh
- * DL_DTYPE_FLOAT32 va duong code cu (backend_execute()). KHONG doi hanh
- * vi hien tai cua backend nay. */
 int backend_get_io_dtype(dl_tensor_dtype_t *input_dtype, float *input_scale, int *input_zero_point,
                           dl_tensor_dtype_t *output_dtype, float *output_scale, int *output_zero_point)
 {
-    (void)input_dtype; (void)input_scale; (void)input_zero_point;
-    (void)output_dtype; (void)output_scale; (void)output_zero_point;
-    return -1;
+    dl_tensor_info_t input_info, output_info;
+    if (qnn_tensor_info(&g_input_tensor, &input_info) != 0 ||
+        qnn_tensor_info(&g_output_tensor, &output_info) != 0) return -1;
+    if (input_dtype != NULL) *input_dtype = input_info.dtype;
+    if (input_scale != NULL) *input_scale = input_info.scale;
+    if (input_zero_point != NULL) *input_zero_point = input_info.zero_point;
+    if (output_dtype != NULL) *output_dtype = output_info.dtype;
+    if (output_scale != NULL) *output_scale = output_info.scale;
+    if (output_zero_point != NULL) *output_zero_point = output_info.zero_point;
+    return 0;
 }
 
-/* Backend nay khong dung duong "raw" (chi co model float32) - khong bao
- * gio duoc goi thuc te vi backend_get_io_dtype() da tra -1 o tren, nhung
- * van dinh nghia de link OK. */
 int backend_execute_raw(const void *input, int input_count, void *output, int output_count)
 {
-    (void)input; (void)input_count; (void)output; (void)output_count;
-    return -1;
+    if (!g_backend_ready || input == NULL || output == NULL) return -1;
+    dl_tensor_dtype_t input_dtype = map_qnn_dtype(g_input_tensor.v1.dataType);
+    dl_tensor_dtype_t output_dtype = map_qnn_dtype(g_output_tensor.v1.dataType);
+    size_t input_size = dtype_size(input_dtype);
+    size_t output_size = dtype_size(output_dtype);
+    if (input_size == 0 || output_size == 0) return -1;
+
+    g_input_tensor.v1.clientBuf.data = (void *)input;
+    g_input_tensor.v1.clientBuf.dataSize = (uint32_t)((size_t)input_count * input_size);
+    g_output_tensor.v1.clientBuf.data = output;
+    g_output_tensor.v1.clientBuf.dataSize = (uint32_t)((size_t)output_count * output_size);
+    Qnn_Tensor_t inputs[1] = {g_input_tensor};
+    Qnn_Tensor_t outputs[1] = {g_output_tensor};
+    Qnn_ErrorHandle_t status = g_qnn.graphExecute(g_graph_handle, inputs, 1, outputs, 1, NULL, NULL);
+    if (status != QNN_SUCCESS) {
+        fprintf(stderr, "backend_qnn_api: QnnGraph_execute(raw) failed (0x%lx)\n",
+                (unsigned long)status);
+        return -1;
+    }
+    return 0;
 }

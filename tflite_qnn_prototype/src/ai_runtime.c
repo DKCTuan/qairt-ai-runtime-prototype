@@ -1,9 +1,12 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "ai_runtime.h"
 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "backend.h"
@@ -32,6 +35,26 @@ static int   g_output_zero_point = 0;
  * phat neu thuc su can (dtype != FLOAT32) - xem dl_init(). */
 static void *g_raw_input_buf  = NULL;
 static void *g_raw_output_buf = NULL;
+
+struct dl_runtime {
+    unsigned int magic;
+    dl_tensor_info_t input_info;
+    dl_tensor_info_t output_info;
+};
+
+#define DL_RUNTIME_MAGIC 0x444C5254u
+static dl_runtime_t *g_runtime_owner = NULL;
+
+static int monotonic_time_ms(double *time_ms)
+{
+    struct timespec timestamp;
+    if (time_ms == NULL || clock_gettime(CLOCK_MONOTONIC, &timestamp) != 0) {
+        return -1;
+    }
+    *time_ms = (double)timestamp.tv_sec * 1000.0
+             + (double)timestamp.tv_nsec / 1000000.0;
+    return 0;
+}
 
 static int argmax(const float *values, int count)
 {
@@ -217,8 +240,12 @@ int dl_inference_ex(const float *input, dl_result_t *result)
      * argmax()/quantize/dequantize ben duoi, vi muc dich la so sanh thoi
      * gian INFERENCE THAT giua cac backend (CPU/HTP), khong phai tong thoi
      * gian ca ham. */
-    struct timespec t_start, t_end;
-    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    double start_ms = 0.0;
+    double end_ms = 0.0;
+    if (monotonic_time_ms(&start_ms) != 0) {
+        fprintf(stderr, "ai_runtime: CLOCK_MONOTONIC start failed\n");
+        return -1;
+    }
 
     int exec_status;
 
@@ -269,19 +296,19 @@ int dl_inference_ex(const float *input, dl_result_t *result)
         }
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    if (monotonic_time_ms(&end_ms) != 0) {
+        fprintf(stderr, "ai_runtime: CLOCK_MONOTONIC end failed\n");
+        return -1;
+    }
 
     if (exec_status != 0) {
         return -1;
     }
 
-    double elapsed_ms = (double)(t_end.tv_sec - t_start.tv_sec) * 1000.0
-                       + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e6;
-
     result->scores = g_scores_buf;
     result->score_count = g_output_count;
     result->label = argmax(g_scores_buf, g_output_count);
-    result->latency_ms = elapsed_ms;
+    result->latency_ms = end_ms - start_ms;
     return 0;
 }
 
@@ -304,4 +331,161 @@ void dl_deinit(void)
     g_input_count = 0;
     g_output_count = 0;
     g_initialized = 0;
+}
+
+const char *dl_status_string(dl_status_t status)
+{
+    switch (status) {
+        case DL_OK: return "success";
+        case DL_ERROR_INVALID_ARGUMENT: return "invalid argument";
+        case DL_ERROR_NOT_INITIALIZED: return "runtime not initialized";
+        case DL_ERROR_ALREADY_INITIALIZED: return "runtime already initialized";
+        case DL_ERROR_OUT_OF_MEMORY: return "out of memory";
+        case DL_ERROR_BACKEND_INIT: return "backend initialization failed";
+        case DL_ERROR_BACKEND_EXECUTE: return "backend execution failed";
+        case DL_ERROR_UNSUPPORTED: return "operation or tensor layout unsupported";
+        case DL_ERROR_METADATA: return "invalid tensor metadata";
+        case DL_ERROR_SIZE_MISMATCH: return "tensor buffer size mismatch";
+        case DL_ERROR_CLOCK: return "monotonic clock failed";
+        case DL_ERROR_BUSY: return "backend already owned by another runtime";
+        default: return "unknown error";
+    }
+}
+
+static void fill_tensor_info(dl_tensor_info_t *info, const char *name,
+                             dl_tensor_dtype_t dtype, int count,
+                             float scale, int zero_point)
+{
+    memset(info, 0, sizeof(*info));
+    snprintf(info->name, sizeof(info->name), "%s", name);
+    info->dtype = dtype;
+    info->rank = 1;
+    info->dimensions[0] = (uint32_t)count;
+    info->element_count = (size_t)count;
+    info->byte_size = (size_t)count * (dtype == DL_DTYPE_FLOAT32 ? sizeof(float) : 1u);
+    info->scale = scale;
+    info->zero_point = zero_point;
+    info->quantized_axis = -1;
+}
+
+dl_status_t dl_runtime_create(dl_runtime_t **runtime)
+{
+    if (runtime == NULL) return DL_ERROR_INVALID_ARGUMENT;
+    *runtime = NULL;
+    if (g_runtime_owner != NULL || g_initialized) return DL_ERROR_BUSY;
+    if (dl_init() != 0) return DL_ERROR_BACKEND_INIT;
+    dl_runtime_t *created = (dl_runtime_t *)calloc(1, sizeof(*created));
+    if (created == NULL) { dl_deinit(); return DL_ERROR_OUT_OF_MEMORY; }
+    created->magic = DL_RUNTIME_MAGIC;
+    if (backend_get_tensor_info(1, 0, &created->input_info) != 0) {
+        fill_tensor_info(&created->input_info, "input_0", g_input_dtype, g_input_count,
+                         g_input_scale, g_input_zero_point);
+    }
+    if (backend_get_tensor_info(0, 0, &created->output_info) != 0) {
+        fill_tensor_info(&created->output_info, "output_0", g_output_dtype, g_output_count,
+                         g_output_scale, g_output_zero_point);
+    }
+    g_runtime_owner = created;
+    *runtime = created;
+    return DL_OK;
+}
+
+void dl_runtime_destroy(dl_runtime_t *runtime)
+{
+    if (runtime == NULL || runtime->magic != DL_RUNTIME_MAGIC || runtime != g_runtime_owner) return;
+    runtime->magic = 0;
+    g_runtime_owner = NULL;
+    dl_deinit();
+    free(runtime);
+}
+
+static int valid_runtime(const dl_runtime_t *runtime)
+{
+    return runtime != NULL && runtime == g_runtime_owner && runtime->magic == DL_RUNTIME_MAGIC && g_initialized;
+}
+
+dl_status_t dl_runtime_get_tensor_count(const dl_runtime_t *runtime, int *inputs, int *outputs)
+{
+    if (!valid_runtime(runtime)) return DL_ERROR_NOT_INITIALIZED;
+    if (inputs == NULL || outputs == NULL) return DL_ERROR_INVALID_ARGUMENT;
+    *inputs = 1; *outputs = 1; return DL_OK;
+}
+
+dl_status_t dl_runtime_get_input_info(const dl_runtime_t *runtime, int index, dl_tensor_info_t *info)
+{
+    if (!valid_runtime(runtime)) return DL_ERROR_NOT_INITIALIZED;
+    if (index != 0 || info == NULL) return DL_ERROR_INVALID_ARGUMENT;
+    *info = runtime->input_info; return DL_OK;
+}
+
+dl_status_t dl_runtime_get_output_info(const dl_runtime_t *runtime, int index, dl_tensor_info_t *info)
+{
+    if (!valid_runtime(runtime)) return DL_ERROR_NOT_INITIALIZED;
+    if (index != 0 || info == NULL) return DL_ERROR_INVALID_ARGUMENT;
+    *info = runtime->output_info; return DL_OK;
+}
+
+dl_status_t dl_runtime_execute(dl_runtime_t *runtime,
+                               const dl_tensor_t *inputs, int input_count,
+                               dl_tensor_t *outputs, int output_count,
+                               double *latency_ms)
+{
+    if (!valid_runtime(runtime)) return DL_ERROR_NOT_INITIALIZED;
+    if (inputs == NULL || outputs == NULL || input_count != 1 || output_count != 1 ||
+        inputs[0].data == NULL || outputs[0].data == NULL) return DL_ERROR_INVALID_ARGUMENT;
+    if (inputs[0].byte_size != runtime->input_info.byte_size ||
+        outputs[0].byte_size != runtime->output_info.byte_size) return DL_ERROR_SIZE_MISMATCH;
+    double start_ms = 0.0, end_ms = 0.0;
+    if (monotonic_time_ms(&start_ms) != 0) return DL_ERROR_CLOCK;
+    int status = backend_execute_raw(inputs[0].data, (int)runtime->input_info.element_count,
+                                     outputs[0].data, (int)runtime->output_info.element_count);
+    if (monotonic_time_ms(&end_ms) != 0) return DL_ERROR_CLOCK;
+    if (status != 0) return DL_ERROR_BACKEND_EXECUTE;
+    if (latency_ms != NULL) *latency_ms = end_ms - start_ms;
+    return DL_OK;
+}
+
+static int compare_double(const void *left, const void *right)
+{
+    double a = *(const double *)left, b = *(const double *)right;
+    return (a > b) - (a < b);
+}
+
+static double percentile(const double *sorted, int count, double fraction)
+{
+    int index = (int)(fraction * (double)(count - 1) + 0.5);
+    return sorted[index];
+}
+
+dl_status_t dl_runtime_benchmark(dl_runtime_t *runtime,
+                                 const dl_tensor_t *inputs, int input_count,
+                                 dl_tensor_t *outputs, int output_count,
+                                 const dl_benchmark_config_t *config,
+                                 dl_benchmark_result_t *result)
+{
+    if (!valid_runtime(runtime)) return DL_ERROR_NOT_INITIALIZED;
+    if (config == NULL || result == NULL || config->warmup_runs < 0 || config->measured_runs <= 0)
+        return DL_ERROR_INVALID_ARGUMENT;
+    for (int i = 0; i < config->warmup_runs; ++i) {
+        dl_status_t status = dl_runtime_execute(runtime, inputs, input_count, outputs, output_count, NULL);
+        if (status != DL_OK) return status;
+    }
+    double *samples = (double *)malloc(sizeof(*samples) * (size_t)config->measured_runs);
+    if (samples == NULL) return DL_ERROR_OUT_OF_MEMORY;
+    double sum = 0.0;
+    for (int i = 0; i < config->measured_runs; ++i) {
+        dl_status_t status = dl_runtime_execute(runtime, inputs, input_count, outputs, output_count, &samples[i]);
+        if (status != DL_OK) { free(samples); return status; }
+        sum += samples[i];
+    }
+    qsort(samples, (size_t)config->measured_runs, sizeof(*samples), compare_double);
+    result->completed_runs = config->measured_runs;
+    result->min_ms = samples[0]; result->max_ms = samples[config->measured_runs - 1];
+    result->mean_ms = sum / (double)config->measured_runs;
+    result->p50_ms = percentile(samples, config->measured_runs, 0.50);
+    result->p90_ms = percentile(samples, config->measured_runs, 0.90);
+    result->p95_ms = percentile(samples, config->measured_runs, 0.95);
+    result->p99_ms = percentile(samples, config->measured_runs, 0.99);
+    free(samples);
+    return DL_OK;
 }

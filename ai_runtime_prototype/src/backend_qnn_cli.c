@@ -200,6 +200,22 @@ int backend_get_io_count(int *input_count, int *output_count)
     return 0;
 }
 
+int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info)
+{
+    if (!g_backend_ready || index != 0 || info == NULL) return -1;
+    int count = is_input ? g_input_count : g_output_count;
+    memset(info, 0, sizeof(*info));
+    snprintf(info->name, sizeof(info->name), "%s", is_input ? g_input_name : g_output_name);
+    info->dtype = DL_DTYPE_FLOAT32;
+    info->rank = 1;
+    info->dimensions[0] = (uint32_t)count;
+    info->element_count = (size_t)count;
+    info->byte_size = (size_t)count * sizeof(float);
+    info->scale = 1.0f;
+    info->quantized_axis = -1;
+    return 0;
+}
+
 int backend_execute(const float *input, int input_count, float *output, int output_count)
 {
     char input_raw_path[2048];
@@ -277,6 +293,6 @@ int backend_get_io_dtype(dl_tensor_dtype_t *input_dtype, float *input_scale, int
  * van dinh nghia de link OK. */
 int backend_execute_raw(const void *input, int input_count, void *output, int output_count)
 {
-    (void)input; (void)input_count; (void)output; (void)output_count;
-    return -1;
+    return backend_execute((const float *)input, input_count,
+                           (float *)output, output_count);
 }

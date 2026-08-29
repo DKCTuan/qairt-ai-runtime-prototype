@@ -1,6 +1,9 @@
 #ifndef AI_RUNTIME_H
 #define AI_RUNTIME_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -15,6 +18,86 @@ extern "C" {
 #ifndef DL_MAX_OUTPUT
 #define DL_MAX_OUTPUT 2000000
 #endif
+
+#define DL_MAX_TENSOR_RANK 8
+#define DL_MAX_TENSOR_NAME 128
+
+typedef enum {
+    DL_OK = 0,
+    DL_ERROR_INVALID_ARGUMENT = -1,
+    DL_ERROR_NOT_INITIALIZED = -2,
+    DL_ERROR_ALREADY_INITIALIZED = -3,
+    DL_ERROR_OUT_OF_MEMORY = -4,
+    DL_ERROR_BACKEND_INIT = -5,
+    DL_ERROR_BACKEND_EXECUTE = -6,
+    DL_ERROR_UNSUPPORTED = -7,
+    DL_ERROR_METADATA = -8,
+    DL_ERROR_SIZE_MISMATCH = -9,
+    DL_ERROR_CLOCK = -10,
+    DL_ERROR_BUSY = -11
+} dl_status_t;
+
+typedef enum {
+    DL_DTYPE_FLOAT32 = 0,
+    DL_DTYPE_UINT8 = 1,
+    DL_DTYPE_INT8 = 2,
+    DL_DTYPE_UNKNOWN = 255
+} dl_tensor_dtype_t;
+
+typedef struct {
+    char name[DL_MAX_TENSOR_NAME];
+    dl_tensor_dtype_t dtype;
+    int rank;
+    uint32_t dimensions[DL_MAX_TENSOR_RANK];
+    size_t element_count;
+    size_t byte_size;
+    float scale;
+    int zero_point;
+    int quantized_axis;
+} dl_tensor_info_t;
+
+typedef struct {
+    void *data;
+    size_t byte_size;
+} dl_tensor_t;
+
+typedef struct {
+    int warmup_runs;
+    int measured_runs;
+} dl_benchmark_config_t;
+
+typedef struct {
+    int completed_runs;
+    double min_ms;
+    double max_ms;
+    double mean_ms;
+    double p50_ms;
+    double p90_ms;
+    double p95_ms;
+    double p99_ms;
+} dl_benchmark_result_t;
+
+typedef struct dl_runtime dl_runtime_t;
+
+const char *dl_status_string(dl_status_t status);
+dl_status_t dl_runtime_create(dl_runtime_t **runtime);
+void dl_runtime_destroy(dl_runtime_t *runtime);
+dl_status_t dl_runtime_get_tensor_count(const dl_runtime_t *runtime,
+                                        int *input_tensor_count,
+                                        int *output_tensor_count);
+dl_status_t dl_runtime_get_input_info(const dl_runtime_t *runtime, int index,
+                                      dl_tensor_info_t *info);
+dl_status_t dl_runtime_get_output_info(const dl_runtime_t *runtime, int index,
+                                       dl_tensor_info_t *info);
+dl_status_t dl_runtime_execute(dl_runtime_t *runtime,
+                               const dl_tensor_t *inputs, int input_tensor_count,
+                               dl_tensor_t *outputs, int output_tensor_count,
+                               double *latency_ms);
+dl_status_t dl_runtime_benchmark(dl_runtime_t *runtime,
+                                 const dl_tensor_t *inputs, int input_tensor_count,
+                                 dl_tensor_t *outputs, int output_tensor_count,
+                                 const dl_benchmark_config_t *config,
+                                 dl_benchmark_result_t *result);
 
 typedef struct {
     int label;
@@ -33,6 +116,8 @@ typedef struct {
     double latency_ms;
 } dl_result_t;
 
+/* Legacy single-model float API. New applications should prefer the
+ * instance-based dl_runtime_* API above. */
 int dl_init(void);
 
 /* Goi sau dl_init() thanh cong, truoc khi cap phat buffer input va goi

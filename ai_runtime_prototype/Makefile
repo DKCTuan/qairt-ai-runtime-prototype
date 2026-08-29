@@ -2,11 +2,12 @@ CC ?= gcc
 AR ?= ar
 BACKEND ?= mock
 
-CFLAGS ?= -O2 -Wall -Wextra -Iinclude -Isrc
+CFLAGS ?= -O2 -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -Iinclude -Isrc
 
 BUILD_DIR := build/$(BACKEND)
 LIB := $(BUILD_DIR)/libai_runtime.a
 APP := $(BUILD_DIR)/traffic_app
+TEST_APP := $(BUILD_DIR)/runtime_api_test
 
 DL_QAIRT_ROOT ?= /home/congtuan/qairt_sdk/qairt/2.44.0.260225
 
@@ -26,7 +27,7 @@ RUNTIME_OBJS := \
 	$(BUILD_DIR)/ai_runtime.o \
 	$(BUILD_DIR)/backend.o
 
-.PHONY: all clean run
+.PHONY: all clean run test
 
 all: $(APP)
 
@@ -46,7 +47,13 @@ $(APP): examples/main.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) -o $@ $(LDLIBS)
 
 run: $(APP)
-	./$(APP)
+	$(APP)
+
+$(TEST_APP): tests/runtime_api_test.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) -o $@ $(LDLIBS)
+
+test: $(TEST_APP)
+	$(TEST_APP)
 
 clean:
 	rm -rf build

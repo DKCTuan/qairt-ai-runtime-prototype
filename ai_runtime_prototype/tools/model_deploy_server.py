@@ -46,6 +46,7 @@ def namespace_for_convert(body):
         output=body.get('output'),
         converter=body.get('converter', 'auto'),
         source_model_input_shape=body.get('source_model_input_shape'),
+        pytorch_input_dim=body.get('pytorch_input_dim'),
         out_tensor_node=body.get('out_tensor_node'),
         extra_args=body.get('extra_args', []),
     )
@@ -60,6 +61,7 @@ def namespace_for_prepare(body):
         work_dir=body.get('work_dir'),
         converter=body.get('converter', 'auto'),
         source_model_input_shape=body.get('source_model_input_shape'),
+        pytorch_input_dim=body.get('pytorch_input_dim'),
         out_tensor_node=body.get('out_tensor_node'),
         extra_args=body.get('extra_args', []),
         backend=body.get('backend', 'cpu'),
@@ -81,6 +83,7 @@ def namespace_for_deploy(body):
         work_dir=body.get('work_dir', str(model_deploy.DEFAULT_WORK_ROOT / 'api_deploy')),
         converter=body.get('converter', 'auto'),
         source_model_input_shape=body.get('source_model_input_shape'),
+        pytorch_input_dim=body.get('pytorch_input_dim'),
         out_tensor_node=body.get('out_tensor_node'),
         extra_args=body.get('extra_args', []),
         backend=body.get('backend', 'cpu'),
@@ -90,6 +93,16 @@ def namespace_for_deploy(body):
         ar=body.get('ar'),
         reference=body.get('reference'),
         tolerance=float(body.get('tolerance', 1e-5)),
+    )
+
+
+def namespace_for_doctor(body):
+    body = normalize_body(body)
+    return argparse.Namespace(
+        qairt_root=body.get('qairt_root', str(model_deploy.DEFAULT_QAIRT_ROOT)),
+        model=body.get('model'),
+        backend=body.get('backend', 'cpu'),
+        target=body.get('target', model_deploy.DEFAULT_TARGET),
     )
 
 
@@ -168,6 +181,9 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/convert':
                 result = capture_json(model_deploy.command_convert, namespace_for_convert(body))
                 self._send(200, result)
+            elif self.path == '/doctor':
+                result, exit_code = capture_json_allow_exit(model_deploy.command_doctor, namespace_for_doctor(body))
+                self._send(200 if exit_code == 0 else 422, result)
             elif self.path == '/prepare':
                 result = capture_json(model_deploy.command_prepare, namespace_for_prepare(body))
                 self._send(200, result)

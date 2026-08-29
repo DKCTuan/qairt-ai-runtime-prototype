@@ -2,7 +2,7 @@ CC ?= gcc
 AR ?= ar
 BACKEND ?= tflite_delegate
 
-CFLAGS ?= -O2 -Wall -Wextra -Iinclude -Isrc
+CFLAGS ?= -O2 -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -Iinclude -Isrc
 
 ARCH ?= x86_64
 
