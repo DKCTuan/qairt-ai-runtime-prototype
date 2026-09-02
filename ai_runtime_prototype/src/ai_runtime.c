@@ -38,8 +38,10 @@ static void *g_raw_output_buf = NULL;
 
 struct dl_runtime {
     unsigned int magic;
-    dl_tensor_info_t input_info;
-    dl_tensor_info_t output_info;
+    int input_tensor_count;
+    int output_tensor_count;
+    dl_tensor_info_t *input_infos;
+    dl_tensor_info_t *output_infos;
 };
 
 #define DL_RUNTIME_MAGIC 0x444C5254u
@@ -73,11 +75,15 @@ static int argmax(const float *values, int count)
 
 int dl_init(void)
 {
+    if (g_runtime_owner != NULL) {
+        return -1;
+    }
     if (g_initialized) {
         return 0;
     }
 
     if (backend_init() != 0) {
+        backend_deinit();
         return -1;
     }
 
@@ -126,6 +132,13 @@ int dl_init(void)
         g_output_scale = out_scale;
         g_input_zero_point = in_zp;
         g_output_zero_point = out_zp;
+    }
+    if ((g_input_dtype != DL_DTYPE_FLOAT32 && g_input_dtype != DL_DTYPE_UINT8 &&
+         g_input_dtype != DL_DTYPE_INT8) ||
+        (g_output_dtype != DL_DTYPE_FLOAT32 && g_output_dtype != DL_DTYPE_UINT8 &&
+         g_output_dtype != DL_DTYPE_INT8)) {
+        fprintf(stderr, "ai_runtime: legacy API supports only float32/uint8/int8; use dl_runtime_* raw tensors\n");
+        free(g_scores_buf); g_scores_buf = NULL; backend_deinit(); return -1;
     }
     /* LUU Y QUAN TRONG: ban ai_runtime.c nay CHI duoc sua trong thu muc
      * tflite_qnn_prototype/ (noi Makefile chi ho tro BACKEND=tflite_delegate
@@ -352,22 +365,6 @@ const char *dl_status_string(dl_status_t status)
     }
 }
 
-static void fill_tensor_info(dl_tensor_info_t *info, const char *name,
-                             dl_tensor_dtype_t dtype, int count,
-                             float scale, int zero_point)
-{
-    memset(info, 0, sizeof(*info));
-    snprintf(info->name, sizeof(info->name), "%s", name);
-    info->dtype = dtype;
-    info->rank = 1;
-    info->dimensions[0] = (uint32_t)count;
-    info->element_count = (size_t)count;
-    info->byte_size = (size_t)count * (dtype == DL_DTYPE_FLOAT32 ? sizeof(float) : 1u);
-    info->scale = scale;
-    info->zero_point = zero_point;
-    info->quantized_axis = -1;
-}
-
 dl_status_t dl_runtime_create(dl_runtime_t **runtime)
 {
     if (runtime == NULL) {
@@ -377,23 +374,46 @@ dl_status_t dl_runtime_create(dl_runtime_t **runtime)
     if (g_runtime_owner != NULL || g_initialized) {
         return DL_ERROR_BUSY;
     }
-    if (dl_init() != 0) {
+    if (backend_init() != 0) {
+        backend_deinit();
         return DL_ERROR_BACKEND_INIT;
     }
 
     dl_runtime_t *created = (dl_runtime_t *)calloc(1, sizeof(*created));
     if (created == NULL) {
-        dl_deinit();
+        backend_deinit();
         return DL_ERROR_OUT_OF_MEMORY;
     }
     created->magic = DL_RUNTIME_MAGIC;
-    if (backend_get_tensor_info(1, 0, &created->input_info) != 0) {
-        fill_tensor_info(&created->input_info, "input_0", g_input_dtype, g_input_count,
-                         g_input_scale, g_input_zero_point);
+    if (backend_get_tensor_count(&created->input_tensor_count,
+                                 &created->output_tensor_count) != 0 ||
+        created->input_tensor_count <= 0 || created->output_tensor_count <= 0) {
+        backend_deinit();
+        free(created);
+        return DL_ERROR_METADATA;
     }
-    if (backend_get_tensor_info(0, 0, &created->output_info) != 0) {
-        fill_tensor_info(&created->output_info, "output_0", g_output_dtype, g_output_count,
-                         g_output_scale, g_output_zero_point);
+    created->input_infos = (dl_tensor_info_t *)calloc((size_t)created->input_tensor_count,
+                                                       sizeof(*created->input_infos));
+    created->output_infos = (dl_tensor_info_t *)calloc((size_t)created->output_tensor_count,
+                                                        sizeof(*created->output_infos));
+    if (created->input_infos == NULL || created->output_infos == NULL) {
+        free(created->input_infos);
+        free(created->output_infos);
+        backend_deinit();
+        free(created);
+        return DL_ERROR_OUT_OF_MEMORY;
+    }
+    for (int i = 0; i < created->input_tensor_count; ++i) {
+        if (backend_get_tensor_info(1, i, &created->input_infos[i]) != 0) {
+            free(created->input_infos); free(created->output_infos);
+            backend_deinit(); free(created); return DL_ERROR_METADATA;
+        }
+    }
+    for (int i = 0; i < created->output_tensor_count; ++i) {
+        if (backend_get_tensor_info(0, i, &created->output_infos[i]) != 0) {
+            free(created->input_infos); free(created->output_infos);
+            backend_deinit(); free(created); return DL_ERROR_METADATA;
+        }
     }
     g_runtime_owner = created;
     *runtime = created;
@@ -407,14 +427,16 @@ void dl_runtime_destroy(dl_runtime_t *runtime)
     }
     runtime->magic = 0;
     g_runtime_owner = NULL;
-    dl_deinit();
+    backend_deinit();
+    free(runtime->input_infos);
+    free(runtime->output_infos);
     free(runtime);
 }
 
 static int valid_runtime(const dl_runtime_t *runtime)
 {
     return runtime != NULL && runtime == g_runtime_owner &&
-           runtime->magic == DL_RUNTIME_MAGIC && g_initialized;
+           runtime->magic == DL_RUNTIME_MAGIC;
 }
 
 dl_status_t dl_runtime_get_tensor_count(const dl_runtime_t *runtime,
@@ -423,8 +445,8 @@ dl_status_t dl_runtime_get_tensor_count(const dl_runtime_t *runtime,
 {
     if (!valid_runtime(runtime)) return DL_ERROR_NOT_INITIALIZED;
     if (input_tensor_count == NULL || output_tensor_count == NULL) return DL_ERROR_INVALID_ARGUMENT;
-    *input_tensor_count = 1;
-    *output_tensor_count = 1;
+    *input_tensor_count = runtime->input_tensor_count;
+    *output_tensor_count = runtime->output_tensor_count;
     return DL_OK;
 }
 
@@ -432,8 +454,8 @@ dl_status_t dl_runtime_get_input_info(const dl_runtime_t *runtime, int index,
                                       dl_tensor_info_t *info)
 {
     if (!valid_runtime(runtime)) return DL_ERROR_NOT_INITIALIZED;
-    if (index != 0 || info == NULL) return DL_ERROR_INVALID_ARGUMENT;
-    *info = runtime->input_info;
+    if (index < 0 || index >= runtime->input_tensor_count || info == NULL) return DL_ERROR_INVALID_ARGUMENT;
+    *info = runtime->input_infos[index];
     return DL_OK;
 }
 
@@ -441,8 +463,8 @@ dl_status_t dl_runtime_get_output_info(const dl_runtime_t *runtime, int index,
                                        dl_tensor_info_t *info)
 {
     if (!valid_runtime(runtime)) return DL_ERROR_NOT_INITIALIZED;
-    if (index != 0 || info == NULL) return DL_ERROR_INVALID_ARGUMENT;
-    *info = runtime->output_info;
+    if (index < 0 || index >= runtime->output_tensor_count || info == NULL) return DL_ERROR_INVALID_ARGUMENT;
+    *info = runtime->output_infos[index];
     return DL_OK;
 }
 
@@ -452,15 +474,20 @@ dl_status_t dl_runtime_execute(dl_runtime_t *runtime,
                                double *latency_ms)
 {
     if (!valid_runtime(runtime)) return DL_ERROR_NOT_INITIALIZED;
-    if (inputs == NULL || outputs == NULL || input_tensor_count != 1 || output_tensor_count != 1 ||
-        inputs[0].data == NULL || outputs[0].data == NULL) return DL_ERROR_INVALID_ARGUMENT;
-    if (inputs[0].byte_size != runtime->input_info.byte_size ||
-        outputs[0].byte_size != runtime->output_info.byte_size) return DL_ERROR_SIZE_MISMATCH;
+    if (inputs == NULL || outputs == NULL || input_tensor_count != runtime->input_tensor_count ||
+        output_tensor_count != runtime->output_tensor_count) return DL_ERROR_INVALID_ARGUMENT;
+    for (int i = 0; i < input_tensor_count; ++i) {
+        if (inputs[i].data == NULL) return DL_ERROR_INVALID_ARGUMENT;
+        if (inputs[i].byte_size != runtime->input_infos[i].byte_size) return DL_ERROR_SIZE_MISMATCH;
+    }
+    for (int i = 0; i < output_tensor_count; ++i) {
+        if (outputs[i].data == NULL) return DL_ERROR_INVALID_ARGUMENT;
+        if (outputs[i].byte_size != runtime->output_infos[i].byte_size) return DL_ERROR_SIZE_MISMATCH;
+    }
 
     double start_ms = 0.0, end_ms = 0.0;
     if (monotonic_time_ms(&start_ms) != 0) return DL_ERROR_CLOCK;
-    int status = backend_execute_raw(inputs[0].data, (int)runtime->input_info.element_count,
-                                     outputs[0].data, (int)runtime->output_info.element_count);
+    int status = backend_execute_tensors(inputs, input_tensor_count, outputs, output_tensor_count);
     if (monotonic_time_ms(&end_ms) != 0) return DL_ERROR_CLOCK;
     if (status != 0) return DL_ERROR_BACKEND_EXECUTE;
     if (latency_ms != NULL) *latency_ms = end_ms - start_ms;

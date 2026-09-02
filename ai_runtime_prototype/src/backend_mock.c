@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Mock backend gia lap shape cua traffic_qos_model (240 input, 5 output/
@@ -10,18 +11,23 @@
  * model that thi dung backend qnn_cli/qnn_api, khong sua so o day. */
 #define MOCK_INPUT_COUNT 240
 #define MOCK_OUTPUT_COUNT 5
+#define MOCK_SECOND_INPUT_COUNT 3
+#define MOCK_SECOND_OUTPUT_COUNT 2
 
 static int g_backend_ready = 0;
+static int g_multi_io = 0;
 
 int backend_init(void)
 {
+    const char *multi = getenv("DL_MOCK_MULTI_IO");
+    g_multi_io = multi != NULL && multi[0] != '\0' && strcmp(multi, "0") != 0;
     g_backend_ready = 1;
     return 0;
 }
 
 int backend_get_io_count(int *input_count, int *output_count)
 {
-    if (!g_backend_ready) {
+    if (!g_backend_ready || g_multi_io) {
         return -1;
     }
     if (input_count != NULL) {
@@ -33,12 +39,23 @@ int backend_get_io_count(int *input_count, int *output_count)
     return 0;
 }
 
+int backend_get_tensor_count(int *input_tensor_count, int *output_tensor_count)
+{
+    if (!g_backend_ready || input_tensor_count == NULL || output_tensor_count == NULL) return -1;
+    *input_tensor_count = g_multi_io ? 2 : 1;
+    *output_tensor_count = g_multi_io ? 2 : 1;
+    return 0;
+}
+
 int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info)
 {
-    if (!g_backend_ready || index != 0 || info == NULL) return -1;
-    int count = is_input ? MOCK_INPUT_COUNT : MOCK_OUTPUT_COUNT;
+    int tensor_count = g_multi_io ? 2 : 1;
+    if (!g_backend_ready || index < 0 || index >= tensor_count || info == NULL) return -1;
+    int count = is_input
+        ? (index == 0 ? MOCK_INPUT_COUNT : MOCK_SECOND_INPUT_COUNT)
+        : (index == 0 ? MOCK_OUTPUT_COUNT : MOCK_SECOND_OUTPUT_COUNT);
     memset(info, 0, sizeof(*info));
-    snprintf(info->name, sizeof(info->name), "%s", is_input ? "mock_input" : "mock_output");
+    snprintf(info->name, sizeof(info->name), "%s_%d", is_input ? "mock_input" : "mock_output", index);
     info->dtype = DL_DTYPE_FLOAT32;
     info->rank = 1;
     info->dimensions[0] = (uint32_t)count;
@@ -68,6 +85,7 @@ int backend_execute(const float *input, int input_count, float *output, int outp
 void backend_deinit(void)
 {
     g_backend_ready = 0;
+    g_multi_io = 0;
 }
 
 /* THEM MOI (dong bo voi backend.h/tflite_qnn_prototype): backend nay chua
@@ -90,4 +108,26 @@ int backend_execute_raw(const void *input, int input_count, void *output, int ou
 {
     return backend_execute((const float *)input, input_count,
                            (float *)output, output_count);
+}
+
+int backend_execute_tensors(const dl_tensor_t *inputs, int input_tensor_count,
+                            dl_tensor_t *outputs, int output_tensor_count)
+{
+    int expected_tensors = g_multi_io ? 2 : 1;
+    if (inputs == NULL || outputs == NULL || input_tensor_count != expected_tensors ||
+        output_tensor_count != expected_tensors ||
+        inputs[0].byte_size != (size_t)MOCK_INPUT_COUNT * sizeof(float) ||
+        outputs[0].byte_size != (size_t)MOCK_OUTPUT_COUNT * sizeof(float)) return -1;
+    if (backend_execute((const float *)inputs[0].data, MOCK_INPUT_COUNT,
+                        (float *)outputs[0].data, MOCK_OUTPUT_COUNT) != 0) return -1;
+    if (g_multi_io) {
+        if (inputs[1].data == NULL || outputs[1].data == NULL ||
+            inputs[1].byte_size != (size_t)MOCK_SECOND_INPUT_COUNT * sizeof(float) ||
+            outputs[1].byte_size != (size_t)MOCK_SECOND_OUTPUT_COUNT * sizeof(float)) return -1;
+        const float *second_input = (const float *)inputs[1].data;
+        float *second_output = (float *)outputs[1].data;
+        second_output[0] = second_input[0] + second_input[1] + second_input[2];
+        second_output[1] = second_input[2] - second_input[0];
+    }
+    return 0;
 }

@@ -90,10 +90,73 @@ python3 tools/model_deploy.py deploy \
 
 `run-api` executes locally and currently supports the x86_64 QAIRT target.
 `prepare` should be used to generate artifacts intended for another device.
-The direct-QNN runtime currently supports one input and one output. It reads
-their metadata dynamically and supports FLOAT32 plus per-tensor UINT8/INT8
-scale-offset quantization. Multi-input/output, dynamic shapes, and per-axis
-quantization are rejected explicitly rather than being interpreted wrongly.
+The instance-based `dl_runtime_*` API and direct-QNN/TFLite backends support
+multiple input and output tensors. Tensor metadata is discovered dynamically,
+with FLOAT32 plus per-tensor UINT8/INT8 scale-offset quantization. The legacy
+`dl_inference*` convenience API remains one-input/one-output. Dynamic shapes
+are rejected. QNN per-axis quantized tensors can execute through the raw API;
+their metadata reports the quantized axis and `scale=0` because the compact
+public struct does not expose the full scale array.
+
+Inspect a Context Binary without preparing input data or running inference:
+
+```bash
+python3 tools/model_deploy.py inspect-context \
+  --context /path/to/model.bin --backend cpu
+```
+
+Run it through the generic raw-tensor API. Repeat `--input-raw` in graph
+tensor order for multi-input models; each output is written separately:
+
+```bash
+python3 tools/model_deploy.py run-context \
+  --context /path/to/model.bin \
+  --input-raw input_0.raw --input-raw input_1.raw \
+  --output-dir /path/to/outputs --backend cpu
+```
+
+The raw-tensor API recognizes FLOAT16/FLOAT32/FLOAT64, signed and unsigned
+8/16/32/64-bit integers, and BOOL8 where exposed by the backend. The legacy
+float convenience API intentionally accepts only FLOAT32 and per-tensor
+UINT8/INT8.
+
+Validation accepts quantized raw outputs and uses combined absolute/relative
+tolerance. For example:
+
+```bash
+python3 tools/model_deploy.py validate \
+  --dlc model.dlc --input-raw input.raw --reference reference.npy \
+  --output-dtype int8 --output-scale 0.03125 --output-zero-point 0 \
+  --tolerance 1e-3 --relative-tolerance 1e-2
+```
+
+## Package for an Embedded Linux board
+
+Qualcomm HTP deployment needs application-processor libraries (`libQnnHtp.so`,
+`libQnnSystem.so`, and an architecture-matched Stub) as well as a matching
+Hexagon Skel. Create a self-contained bundle before copying anything to the
+board. This command does **not** connect to or modify a device:
+
+```bash
+python3 tools/model_deploy.py package-target \
+  --artifact artifacts/model.htp.bin \
+  --artifact-kind context-binary \
+  --backend htp --htp-arch v73 \
+  --target aarch64-oe-linux-gcc11.2 \
+  --app /path/to/aarch64/traffic_app \
+  --output /path/to/model-v73-bundle
+```
+
+Read `manifest.json` before deployment. Copy the complete directory to the
+board, then run `./run.sh` there. The target ABI, HTP architecture, BSP
+firmware, driver and Context Binary must all match; packaging alone cannot
+prove HTP graph delegation. The manifest includes SHA-256 checksums for every
+payload file. `package-target` currently packages the direct-QNN Context
+Binary path; DLC and TFLite use different entrypoints and runtime dependencies.
+
+The optional REST server mirrors `doctor`, `inspect-context`, `run-context`,
+conversion and validation. Requests are serialized because converter/runtime
+jobs may otherwise collide in shared work directories.
 
 ## Build backends manually
 

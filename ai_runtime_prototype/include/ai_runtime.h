@@ -41,6 +41,15 @@ typedef enum {
     DL_DTYPE_FLOAT32 = 0,
     DL_DTYPE_UINT8 = 1,
     DL_DTYPE_INT8 = 2,
+    DL_DTYPE_FLOAT16 = 3,
+    DL_DTYPE_UINT16 = 4,
+    DL_DTYPE_INT16 = 5,
+    DL_DTYPE_UINT32 = 6,
+    DL_DTYPE_INT32 = 7,
+    DL_DTYPE_UINT64 = 8,
+    DL_DTYPE_INT64 = 9,
+    DL_DTYPE_FLOAT64 = 10,
+    DL_DTYPE_BOOL8 = 11,
     DL_DTYPE_UNKNOWN = 255
 } dl_tensor_dtype_t;
 
@@ -79,6 +88,9 @@ typedef struct {
 
 typedef struct dl_runtime dl_runtime_t;
 
+/* Instance API: metadata and execution support any positive number of input
+ * and output tensors exposed by the selected backend. The current backends
+ * remain singleton-owned, so only one dl_runtime_t may exist at a time. */
 const char *dl_status_string(dl_status_t status);
 dl_status_t dl_runtime_create(dl_runtime_t **runtime);
 void dl_runtime_destroy(dl_runtime_t *runtime);

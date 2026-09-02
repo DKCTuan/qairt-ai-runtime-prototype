@@ -9,6 +9,9 @@ ARCH ?= x86_64
 BUILD_DIR := build/$(BACKEND)-$(ARCH)
 LIB := $(BUILD_DIR)/libai_runtime.a
 APP := $(BUILD_DIR)/traffic_app
+INSPECT_APP := $(BUILD_DIR)/inspect_model
+RUN_MODEL_APP := $(BUILD_DIR)/run_model
+COMMON_EXAMPLE_DIR ?= ../ai_runtime_prototype/examples
 
 # TFLITE_ROOT: thu muc chua include/ (tensorflow/lite/c/c_api.h,
 # tensorflow/lite/delegates/external/external_delegate.h) va lib-$(ARCH)/
@@ -34,7 +37,7 @@ RUNTIME_OBJS := \
 	$(BUILD_DIR)/ai_runtime.o \
 	$(BUILD_DIR)/backend.o
 
-.PHONY: all clean run
+.PHONY: all clean run inspect run-model
 
 all: $(APP)
 
@@ -54,7 +57,17 @@ $(APP): examples/main.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) -o $@ $(LDFLAGS) $(LDLIBS)
 
 run: $(APP)
-	LD_LIBRARY_PATH=$(TFLITE_LIB_DIR):$(DL_QAIRT_ROOT)/lib/x86_64-linux-clang:$$LD_LIBRARY_PATH ./$(APP)
+	LD_LIBRARY_PATH=$(TFLITE_LIB_DIR):$(DL_QAIRT_ROOT)/lib/x86_64-linux-clang:$$LD_LIBRARY_PATH $(APP)
+
+$(INSPECT_APP): $(COMMON_EXAMPLE_DIR)/inspect_model.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) -o $@ $(LDFLAGS) $(LDLIBS)
+
+inspect: $(INSPECT_APP)
+
+$(RUN_MODEL_APP): $(COMMON_EXAMPLE_DIR)/run_model.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) -o $@ $(LDFLAGS) $(LDLIBS)
+
+run-model: $(RUN_MODEL_APP)
 
 clean:
 	rm -rf build

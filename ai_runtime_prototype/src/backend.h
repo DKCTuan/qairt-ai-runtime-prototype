@@ -13,6 +13,7 @@ int backend_init(void);
  * env var - xem comment trong tung file backend_*.c.
  * Return 0 neu thanh cong, -1 neu that bai. */
 int backend_get_io_count(int *input_count, int *output_count);
+int backend_get_tensor_count(int *input_tensor_count, int *output_tensor_count);
 int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info);
 
 int backend_execute(const float *input, int input_count, float *output, int output_count);
@@ -44,5 +45,7 @@ int backend_get_io_dtype(dl_tensor_dtype_t *input_dtype, float *input_scale, int
  * FLOAT32; neu model la float32 thuan thi cu dung backend_execute() cu la
  * du, khong can ham nay. Return 0 neu thanh cong. */
 int backend_execute_raw(const void *input, int input_count, void *output, int output_count);
+int backend_execute_tensors(const dl_tensor_t *inputs, int input_tensor_count,
+                            dl_tensor_t *outputs, int output_tensor_count);
 
 #endif

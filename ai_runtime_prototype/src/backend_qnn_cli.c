@@ -200,6 +200,14 @@ int backend_get_io_count(int *input_count, int *output_count)
     return 0;
 }
 
+int backend_get_tensor_count(int *input_tensor_count, int *output_tensor_count)
+{
+    if (!g_backend_ready || input_tensor_count == NULL || output_tensor_count == NULL) return -1;
+    *input_tensor_count = 1;
+    *output_tensor_count = 1;
+    return 0;
+}
+
 int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info)
 {
     if (!g_backend_ready || index != 0 || info == NULL) return -1;
@@ -295,4 +303,14 @@ int backend_execute_raw(const void *input, int input_count, void *output, int ou
 {
     return backend_execute((const float *)input, input_count,
                            (float *)output, output_count);
+}
+
+int backend_execute_tensors(const dl_tensor_t *inputs, int input_tensor_count,
+                            dl_tensor_t *outputs, int output_tensor_count)
+{
+    if (inputs == NULL || outputs == NULL || input_tensor_count != 1 || output_tensor_count != 1 ||
+        inputs[0].byte_size != (size_t)g_input_count * sizeof(float) ||
+        outputs[0].byte_size != (size_t)g_output_count * sizeof(float)) return -1;
+    return backend_execute((const float *)inputs[0].data, g_input_count,
+                           (float *)outputs[0].data, g_output_count);
 }

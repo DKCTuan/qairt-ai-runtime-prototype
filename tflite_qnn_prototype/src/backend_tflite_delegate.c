@@ -305,15 +305,25 @@ int backend_init(void)
 static dl_tensor_dtype_t map_tflite_type(TfLiteType t)
 {
     switch (t) {
+        case kTfLiteFloat32: return DL_DTYPE_FLOAT32;
         case kTfLiteUInt8: return DL_DTYPE_UINT8;
         case kTfLiteInt8:  return DL_DTYPE_INT8;
-        default:           return DL_DTYPE_FLOAT32; /* kTfLiteFloat32 va cac loai khac chua ho tro */
+        case kTfLiteFloat16: return DL_DTYPE_FLOAT16;
+        case kTfLiteUInt16: return DL_DTYPE_UINT16;
+        case kTfLiteInt16: return DL_DTYPE_INT16;
+        case kTfLiteUInt32: return DL_DTYPE_UINT32;
+        case kTfLiteInt32: return DL_DTYPE_INT32;
+        case kTfLiteInt64: return DL_DTYPE_INT64;
+        case kTfLiteBool: return DL_DTYPE_BOOL8;
+        default: return DL_DTYPE_UNKNOWN;
     }
 }
 
 int backend_get_io_count(int *input_count, int *output_count)
 {
-    if (!g_backend_ready || input_count == NULL || output_count == NULL) {
+    if (!g_backend_ready || input_count == NULL || output_count == NULL ||
+        TfLiteInterpreterGetInputTensorCount(g_interpreter) != 1 ||
+        TfLiteInterpreterGetOutputTensorCount(g_interpreter) != 1) {
         return -1;
     }
 
@@ -332,6 +342,11 @@ int backend_get_io_count(int *input_count, int *output_count)
      * ket qua giu nguyen y het truoc day. */
     TfLiteType in_type = TfLiteTensorType(in_tensor);
     TfLiteType out_type = TfLiteTensorType(out_tensor);
+    if ((in_type != kTfLiteFloat32 && in_type != kTfLiteUInt8 && in_type != kTfLiteInt8) ||
+        (out_type != kTfLiteFloat32 && out_type != kTfLiteUInt8 && out_type != kTfLiteInt8)) {
+        fprintf(stderr, "backend_tflite_delegate: legacy API supports only float32/uint8/int8\n");
+        return -1;
+    }
     size_t in_elem_size = (in_type == kTfLiteUInt8 || in_type == kTfLiteInt8) ? 1 : sizeof(float);
     size_t out_elem_size = (out_type == kTfLiteUInt8 || out_type == kTfLiteInt8) ? 1 : sizeof(float);
 
@@ -340,9 +355,20 @@ int backend_get_io_count(int *input_count, int *output_count)
     return 0;
 }
 
+int backend_get_tensor_count(int *input_tensor_count, int *output_tensor_count)
+{
+    if (!g_backend_ready || input_tensor_count == NULL || output_tensor_count == NULL) return -1;
+    *input_tensor_count = TfLiteInterpreterGetInputTensorCount(g_interpreter);
+    *output_tensor_count = TfLiteInterpreterGetOutputTensorCount(g_interpreter);
+    return (*input_tensor_count > 0 && *output_tensor_count > 0) ? 0 : -1;
+}
+
 int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info)
 {
-    if (!g_backend_ready || index != 0 || info == NULL) return -1;
+    if (!g_backend_ready || index < 0 || info == NULL) return -1;
+    int tensor_count = is_input ? TfLiteInterpreterGetInputTensorCount(g_interpreter)
+                                : TfLiteInterpreterGetOutputTensorCount(g_interpreter);
+    if (index >= tensor_count) return -1;
     const TfLiteTensor *tensor = is_input
         ? TfLiteInterpreterGetInputTensor(g_interpreter, index)
         : TfLiteInterpreterGetOutputTensor(g_interpreter, index);
@@ -352,7 +378,7 @@ int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info)
     const char *name = TfLiteTensorName(tensor);
     snprintf(info->name, sizeof(info->name), "%s", name != NULL ? name : (is_input ? "input_0" : "output_0"));
     info->dtype = map_tflite_type(TfLiteTensorType(tensor));
-    if (info->dtype == DL_DTYPE_FLOAT32 && TfLiteTensorType(tensor) != kTfLiteFloat32) return -1;
+    if (info->dtype == DL_DTYPE_UNKNOWN) return -1;
     info->rank = TfLiteTensorNumDims(tensor);
     if (info->rank < 0 || info->rank > DL_MAX_TENSOR_RANK) return -1;
     size_t count = 1;
@@ -491,6 +517,38 @@ int backend_execute_raw(const void *input, int input_count, void *output, int ou
         return -1;
     }
 
+    return 0;
+}
+
+int backend_execute_tensors(const dl_tensor_t *inputs, int input_tensor_count,
+                            dl_tensor_t *outputs, int output_tensor_count)
+{
+    if (!g_backend_ready || inputs == NULL || outputs == NULL ||
+        input_tensor_count != TfLiteInterpreterGetInputTensorCount(g_interpreter) ||
+        output_tensor_count != TfLiteInterpreterGetOutputTensorCount(g_interpreter)) return -1;
+
+    for (int i = 0; i < input_tensor_count; ++i) {
+        TfLiteTensor *tensor = TfLiteInterpreterGetInputTensor(g_interpreter, i);
+        if (tensor == NULL || inputs[i].data == NULL ||
+            inputs[i].byte_size != TfLiteTensorByteSize(tensor) ||
+            TfLiteTensorCopyFromBuffer(tensor, inputs[i].data, inputs[i].byte_size) != kTfLiteOk) {
+            fprintf(stderr, "backend_tflite_delegate: failed to copy input tensor %d\n", i);
+            return -1;
+        }
+    }
+    if (TfLiteInterpreterInvoke(g_interpreter) != kTfLiteOk) {
+        fprintf(stderr, "backend_tflite_delegate: multi-tensor Invoke failed\n");
+        return -1;
+    }
+    for (int i = 0; i < output_tensor_count; ++i) {
+        const TfLiteTensor *tensor = TfLiteInterpreterGetOutputTensor(g_interpreter, i);
+        if (tensor == NULL || outputs[i].data == NULL ||
+            outputs[i].byte_size != TfLiteTensorByteSize(tensor) ||
+            TfLiteTensorCopyToBuffer(tensor, outputs[i].data, outputs[i].byte_size) != kTfLiteOk) {
+            fprintf(stderr, "backend_tflite_delegate: failed to copy output tensor %d\n", i);
+            return -1;
+        }
+    }
     return 0;
 }
 

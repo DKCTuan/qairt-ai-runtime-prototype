@@ -55,8 +55,10 @@ static QnnSystemContext_Handle_t g_sys_context_handle = NULL;
 
 /* Tensor lay tu chinh binary info cua context binary (co day du id, name,
  * rank, dimensions) - khong tu dung tu dau nhu ban truoc. */
-static Qnn_Tensor_t g_input_tensor  = {0};
-static Qnn_Tensor_t g_output_tensor = {0};
+static Qnn_Tensor_t *g_input_tensors = NULL;
+static Qnn_Tensor_t *g_output_tensors = NULL;
+static uint32_t g_input_tensor_count = 0;
+static uint32_t g_output_tensor_count = 0;
 
 static int g_backend_ready = 0;
 
@@ -103,11 +105,21 @@ static int load_backend_interface(const char *backend_lib_path)
         return -1;
     }
 
-    /* SDK co the tra ve nhieu provider (vi du nhieu API version). Trong
-     * thuc te nen duyet providers[] va chon cai co
-     * apiVersion.coreApiVersion khop voi header dang build cung, thay vi
-     * luon lay phan tu dau tien. */
-    g_qnn = providers[0]->QNN_INTERFACE_VER_NAME;
+    const QnnInterface_t *selected = NULL;
+    for (uint32_t i = 0; i < num_providers; ++i) {
+        if (providers[i] != NULL &&
+            providers[i]->apiVersion.coreApiVersion.major == QNN_API_VERSION_MAJOR &&
+            providers[i]->apiVersion.coreApiVersion.minor >= QNN_API_VERSION_MINOR) {
+            selected = providers[i];
+            break;
+        }
+    }
+    if (selected == NULL) {
+        fprintf(stderr, "backend_qnn_api: no compatible QNN provider for API %d.%d\n",
+                QNN_API_VERSION_MAJOR, QNN_API_VERSION_MINOR);
+        return -1;
+    }
+    g_qnn = selected->QNN_INTERFACE_VER_NAME;
     return 0;
 }
 
@@ -115,9 +127,19 @@ static int load_system_interface(const char *qairt_root)
 {
     typedef Qnn_ErrorHandle_t (*GetSysProvidersFn)(const QnnSystemInterface_t ***providers, uint32_t *num_providers);
 
+    /* Khong hard-code x86_64 o day: khi traffic_app duoc cross-compile va
+     * dong goi sang Embedded Linux, libQnnSystem.so phai la ban cung ABI
+     * voi libQnnCpu/Gpu/Htp.so tren target. package-target dat bien nay
+     * thanh ./lib/libQnnSystem.so trong bundle. Giu fallback x86_64 de
+     * khong lam vo workflow host da kiem chung. */
+    const char *override_path = getenv("DL_QNN_SYSTEM_LIB");
     char system_lib_path[2048];
-    snprintf(system_lib_path, sizeof(system_lib_path),
-             "%s/lib/x86_64-linux-clang/libQnnSystem.so", qairt_root);
+    if (override_path != NULL && override_path[0] != '\0') {
+        snprintf(system_lib_path, sizeof(system_lib_path), "%s", override_path);
+    } else {
+        snprintf(system_lib_path, sizeof(system_lib_path),
+                 "%s/lib/x86_64-linux-clang/libQnnSystem.so", qairt_root);
+    }
 
     g_system_lib_handle = dlopen(system_lib_path, RTLD_NOW | RTLD_GLOBAL);
     if (g_system_lib_handle == NULL) {
@@ -139,7 +161,21 @@ static int load_system_interface(const char *qairt_root)
         return -1;
     }
 
-    g_qnn_system = providers[0]->QNN_SYSTEM_INTERFACE_VER_NAME;
+    const QnnSystemInterface_t *selected = NULL;
+    for (uint32_t i = 0; i < num_providers; ++i) {
+        if (providers[i] != NULL &&
+            providers[i]->systemApiVersion.major == QNN_SYSTEM_API_VERSION_MAJOR &&
+            providers[i]->systemApiVersion.minor >= QNN_SYSTEM_API_VERSION_MINOR) {
+            selected = providers[i];
+            break;
+        }
+    }
+    if (selected == NULL) {
+        fprintf(stderr, "backend_qnn_api: no compatible QNN System provider for API %d.%d\n",
+                QNN_SYSTEM_API_VERSION_MAJOR, QNN_SYSTEM_API_VERSION_MINOR);
+        return -1;
+    }
+    g_qnn_system = selected->QNN_SYSTEM_INTERFACE_VER_NAME;
     return 0;
 }
 
@@ -253,18 +289,26 @@ static int read_io_tensors_from_binary_info(const void *binary_buffer, uint64_t 
         graph_outputs = target_graph->graphInfoV1.graphOutputs;
     }
 
-    if (num_inputs != 1 || num_outputs != 1) {
-        fprintf(stderr, "backend_qnn_api: this runtime supports exactly 1 input and 1 output "
-                        "(model has %u input(s), %u output(s))\n",
-                num_inputs, num_outputs);
+    if (num_inputs == 0 || num_outputs == 0 || graph_inputs == NULL || graph_outputs == NULL) {
+        fprintf(stderr, "backend_qnn_api: graph has invalid tensor metadata\n");
         return -1;
     }
 
-    /* Copy struct - dimensions/name ben trong van tro vao bo nho do
+    g_input_tensors = (Qnn_Tensor_t *)calloc(num_inputs, sizeof(*g_input_tensors));
+    g_output_tensors = (Qnn_Tensor_t *)calloc(num_outputs, sizeof(*g_output_tensors));
+    if (g_input_tensors == NULL || g_output_tensors == NULL) {
+        free(g_input_tensors); free(g_output_tensors);
+        g_input_tensors = NULL; g_output_tensors = NULL;
+        return -1;
+    }
+
+    /* Copy structs - dimensions/name ben trong van tro vao bo nho do
      * g_sys_context_handle so huu, nen phai giu handle nay song den luc
      * backend_deinit(), khong duoc free som. */
-    g_input_tensor  = graph_inputs[0];
-    g_output_tensor = graph_outputs[0];
+    memcpy(g_input_tensors, graph_inputs, num_inputs * sizeof(*g_input_tensors));
+    memcpy(g_output_tensors, graph_outputs, num_outputs * sizeof(*g_output_tensors));
+    g_input_tensor_count = num_inputs;
+    g_output_tensor_count = num_outputs;
 
     return 0;
 }
@@ -382,14 +426,40 @@ static dl_tensor_dtype_t map_qnn_dtype(Qnn_DataType_t dtype)
         case QNN_DATATYPE_UFIXED_POINT_8: return DL_DTYPE_UINT8;
         case QNN_DATATYPE_INT_8:
         case QNN_DATATYPE_SFIXED_POINT_8: return DL_DTYPE_INT8;
+        case QNN_DATATYPE_FLOAT_16: return DL_DTYPE_FLOAT16;
+        case QNN_DATATYPE_UINT_16:
+        case QNN_DATATYPE_UFIXED_POINT_16: return DL_DTYPE_UINT16;
+        case QNN_DATATYPE_INT_16:
+        case QNN_DATATYPE_SFIXED_POINT_16: return DL_DTYPE_INT16;
+        case QNN_DATATYPE_UINT_32:
+        case QNN_DATATYPE_UFIXED_POINT_32: return DL_DTYPE_UINT32;
+        case QNN_DATATYPE_INT_32:
+        case QNN_DATATYPE_SFIXED_POINT_32: return DL_DTYPE_INT32;
+        case QNN_DATATYPE_UINT_64: return DL_DTYPE_UINT64;
+        case QNN_DATATYPE_INT_64: return DL_DTYPE_INT64;
+        case QNN_DATATYPE_FLOAT_64: return DL_DTYPE_FLOAT64;
+        case QNN_DATATYPE_BOOL_8: return DL_DTYPE_BOOL8;
         default: return DL_DTYPE_UNKNOWN;
     }
 }
 
 static size_t dtype_size(dl_tensor_dtype_t dtype)
 {
-    return dtype == DL_DTYPE_FLOAT32 ? sizeof(float) :
-           (dtype == DL_DTYPE_UINT8 || dtype == DL_DTYPE_INT8 ? 1u : 0u);
+    switch (dtype) {
+        case DL_DTYPE_UINT8:
+        case DL_DTYPE_INT8:
+        case DL_DTYPE_BOOL8: return 1u;
+        case DL_DTYPE_FLOAT16:
+        case DL_DTYPE_UINT16:
+        case DL_DTYPE_INT16: return 2u;
+        case DL_DTYPE_FLOAT32:
+        case DL_DTYPE_UINT32:
+        case DL_DTYPE_INT32: return 4u;
+        case DL_DTYPE_UINT64:
+        case DL_DTYPE_INT64:
+        case DL_DTYPE_FLOAT64: return 8u;
+        default: return 0u;
+    }
 }
 
 static int qnn_tensor_info(const Qnn_Tensor_t *tensor, dl_tensor_info_t *info)
@@ -412,9 +482,15 @@ static int qnn_tensor_info(const Qnn_Tensor_t *tensor, dl_tensor_info_t *info)
     if (tensor->v1.quantizeParams.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET) {
         info->scale = tensor->v1.quantizeParams.scaleOffsetEncoding.scale;
         info->zero_point = -tensor->v1.quantizeParams.scaleOffsetEncoding.offset;
-    } else if (dtype != DL_DTYPE_FLOAT32) {
-        fprintf(stderr, "backend_qnn_api: only per-tensor scale/offset quantization is supported\n");
-        return -1;
+    } else if (tensor->v1.quantizeParams.quantizationEncoding ==
+               QNN_QUANTIZATION_ENCODING_AXIS_SCALE_OFFSET) {
+        /* Raw-tensor execution does not need to transform values, so per-axis
+         * tensors remain executable. The compact public metadata struct has
+         * no scale array; scale=0 signals callers to inspect source/QNN
+         * encodings before attempting float conversion. */
+        info->scale = 0.0f;
+        info->zero_point = 0;
+        info->quantized_axis = tensor->v1.quantizeParams.axisScaleOffsetEncoding.axis;
     }
     return 0;
 }
@@ -474,12 +550,13 @@ int backend_init(void)
 
 int backend_get_io_count(int *input_count, int *output_count)
 {
-    if (!g_backend_ready) {
+    if (!g_backend_ready || g_input_tensor_count != 1 || g_output_tensor_count != 1) {
+        fprintf(stderr, "backend_qnn_api: legacy float API requires exactly one input and one output\n");
         return -1;
     }
 
-    int in_count = tensor_element_count(&g_input_tensor);
-    int out_count = tensor_element_count(&g_output_tensor);
+    int in_count = tensor_element_count(&g_input_tensors[0]);
+    int out_count = tensor_element_count(&g_output_tensors[0]);
 
     if (in_count <= 0 || out_count <= 0) {
         fprintf(stderr, "backend_qnn_api: failed to compute tensor element count from binary metadata\n");
@@ -495,28 +572,42 @@ int backend_get_io_count(int *input_count, int *output_count)
     return 0;
 }
 
+int backend_get_tensor_count(int *input_tensor_count, int *output_tensor_count)
+{
+    if (!g_backend_ready || input_tensor_count == NULL || output_tensor_count == NULL) return -1;
+    *input_tensor_count = (int)g_input_tensor_count;
+    *output_tensor_count = (int)g_output_tensor_count;
+    return 0;
+}
+
 int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info)
 {
-    if (!g_backend_ready || index != 0) return -1;
-    return qnn_tensor_info(is_input ? &g_input_tensor : &g_output_tensor, info);
+    if (!g_backend_ready || index < 0) return -1;
+    if (is_input) {
+        if ((uint32_t)index >= g_input_tensor_count) return -1;
+        return qnn_tensor_info(&g_input_tensors[index], info);
+    }
+    if ((uint32_t)index >= g_output_tensor_count) return -1;
+    return qnn_tensor_info(&g_output_tensors[index], info);
 }
 
 int backend_execute(const float *input, int input_count, float *output, int output_count)
 {
-    if (!g_backend_ready || input == NULL || output == NULL) {
+    if (!g_backend_ready || input == NULL || output == NULL ||
+        g_input_tensor_count != 1 || g_output_tensor_count != 1) {
         return -1;
     }
 
     /* Tro tensor thang vao buffer cua caller trong RAM - khong ghi file
      * trung gian nhu backend_qnn_cli.c. */
-    g_input_tensor.v1.clientBuf.data = (void *)input;
-    g_input_tensor.v1.clientBuf.dataSize = (uint32_t)(input_count * sizeof(float));
+    g_input_tensors[0].v1.clientBuf.data = (void *)input;
+    g_input_tensors[0].v1.clientBuf.dataSize = (uint32_t)(input_count * sizeof(float));
 
-    g_output_tensor.v1.clientBuf.data = (void *)output;
-    g_output_tensor.v1.clientBuf.dataSize = (uint32_t)(output_count * sizeof(float));
+    g_output_tensors[0].v1.clientBuf.data = (void *)output;
+    g_output_tensors[0].v1.clientBuf.dataSize = (uint32_t)(output_count * sizeof(float));
 
-    Qnn_Tensor_t inputs[1]  = { g_input_tensor };
-    Qnn_Tensor_t outputs[1] = { g_output_tensor };
+    Qnn_Tensor_t inputs[1]  = { g_input_tensors[0] };
+    Qnn_Tensor_t outputs[1] = { g_output_tensors[0] };
 
     Qnn_ErrorHandle_t status = g_qnn.graphExecute(
         g_graph_handle,
@@ -561,8 +652,12 @@ void backend_deinit(void)
         g_system_lib_handle = NULL;
     }
 
-    memset(&g_input_tensor, 0, sizeof(g_input_tensor));
-    memset(&g_output_tensor, 0, sizeof(g_output_tensor));
+    free(g_input_tensors);
+    free(g_output_tensors);
+    g_input_tensors = NULL;
+    g_output_tensors = NULL;
+    g_input_tensor_count = 0;
+    g_output_tensor_count = 0;
 
     g_backend_ready = 0;
 }
@@ -570,8 +665,9 @@ int backend_get_io_dtype(dl_tensor_dtype_t *input_dtype, float *input_scale, int
                           dl_tensor_dtype_t *output_dtype, float *output_scale, int *output_zero_point)
 {
     dl_tensor_info_t input_info, output_info;
-    if (qnn_tensor_info(&g_input_tensor, &input_info) != 0 ||
-        qnn_tensor_info(&g_output_tensor, &output_info) != 0) return -1;
+    if (g_input_tensor_count != 1 || g_output_tensor_count != 1 ||
+        qnn_tensor_info(&g_input_tensors[0], &input_info) != 0 ||
+        qnn_tensor_info(&g_output_tensors[0], &output_info) != 0) return -1;
     if (input_dtype != NULL) *input_dtype = input_info.dtype;
     if (input_scale != NULL) *input_scale = input_info.scale;
     if (input_zero_point != NULL) *input_zero_point = input_info.zero_point;
@@ -583,22 +679,69 @@ int backend_get_io_dtype(dl_tensor_dtype_t *input_dtype, float *input_scale, int
 
 int backend_execute_raw(const void *input, int input_count, void *output, int output_count)
 {
-    if (!g_backend_ready || input == NULL || output == NULL) return -1;
-    dl_tensor_dtype_t input_dtype = map_qnn_dtype(g_input_tensor.v1.dataType);
-    dl_tensor_dtype_t output_dtype = map_qnn_dtype(g_output_tensor.v1.dataType);
+    if (!g_backend_ready || input == NULL || output == NULL ||
+        g_input_tensor_count != 1 || g_output_tensor_count != 1) return -1;
+    dl_tensor_dtype_t input_dtype = map_qnn_dtype(g_input_tensors[0].v1.dataType);
+    dl_tensor_dtype_t output_dtype = map_qnn_dtype(g_output_tensors[0].v1.dataType);
     size_t input_size = dtype_size(input_dtype);
     size_t output_size = dtype_size(output_dtype);
     if (input_size == 0 || output_size == 0) return -1;
 
-    g_input_tensor.v1.clientBuf.data = (void *)input;
-    g_input_tensor.v1.clientBuf.dataSize = (uint32_t)((size_t)input_count * input_size);
-    g_output_tensor.v1.clientBuf.data = output;
-    g_output_tensor.v1.clientBuf.dataSize = (uint32_t)((size_t)output_count * output_size);
-    Qnn_Tensor_t inputs[1] = {g_input_tensor};
-    Qnn_Tensor_t outputs[1] = {g_output_tensor};
+    g_input_tensors[0].v1.clientBuf.data = (void *)input;
+    g_input_tensors[0].v1.clientBuf.dataSize = (uint32_t)((size_t)input_count * input_size);
+    g_output_tensors[0].v1.clientBuf.data = output;
+    g_output_tensors[0].v1.clientBuf.dataSize = (uint32_t)((size_t)output_count * output_size);
+    Qnn_Tensor_t inputs[1] = {g_input_tensors[0]};
+    Qnn_Tensor_t outputs[1] = {g_output_tensors[0]};
     Qnn_ErrorHandle_t status = g_qnn.graphExecute(g_graph_handle, inputs, 1, outputs, 1, NULL, NULL);
     if (status != QNN_SUCCESS) {
         fprintf(stderr, "backend_qnn_api: QnnGraph_execute(raw) failed (0x%lx)\n",
+                (unsigned long)status);
+        return -1;
+    }
+    return 0;
+}
+
+int backend_execute_tensors(const dl_tensor_t *inputs, int input_tensor_count,
+                            dl_tensor_t *outputs, int output_tensor_count)
+{
+    if (!g_backend_ready || inputs == NULL || outputs == NULL ||
+        input_tensor_count != (int)g_input_tensor_count ||
+        output_tensor_count != (int)g_output_tensor_count) return -1;
+
+    Qnn_Tensor_t *qnn_inputs = (Qnn_Tensor_t *)malloc(sizeof(*qnn_inputs) * g_input_tensor_count);
+    Qnn_Tensor_t *qnn_outputs = (Qnn_Tensor_t *)malloc(sizeof(*qnn_outputs) * g_output_tensor_count);
+    if (qnn_inputs == NULL || qnn_outputs == NULL) {
+        free(qnn_inputs); free(qnn_outputs); return -1;
+    }
+    memcpy(qnn_inputs, g_input_tensors, sizeof(*qnn_inputs) * g_input_tensor_count);
+    memcpy(qnn_outputs, g_output_tensors, sizeof(*qnn_outputs) * g_output_tensor_count);
+
+    for (uint32_t i = 0; i < g_input_tensor_count; ++i) {
+        dl_tensor_info_t info;
+        if (inputs[i].data == NULL || qnn_tensor_info(&qnn_inputs[i], &info) != 0 ||
+            inputs[i].byte_size != info.byte_size || inputs[i].byte_size > UINT32_MAX) {
+            free(qnn_inputs); free(qnn_outputs); return -1;
+        }
+        qnn_inputs[i].v1.clientBuf.data = inputs[i].data;
+        qnn_inputs[i].v1.clientBuf.dataSize = (uint32_t)inputs[i].byte_size;
+    }
+    for (uint32_t i = 0; i < g_output_tensor_count; ++i) {
+        dl_tensor_info_t info;
+        if (outputs[i].data == NULL || qnn_tensor_info(&qnn_outputs[i], &info) != 0 ||
+            outputs[i].byte_size != info.byte_size || outputs[i].byte_size > UINT32_MAX) {
+            free(qnn_inputs); free(qnn_outputs); return -1;
+        }
+        qnn_outputs[i].v1.clientBuf.data = outputs[i].data;
+        qnn_outputs[i].v1.clientBuf.dataSize = (uint32_t)outputs[i].byte_size;
+    }
+    Qnn_ErrorHandle_t status = g_qnn.graphExecute(
+        g_graph_handle, qnn_inputs, g_input_tensor_count,
+        qnn_outputs, g_output_tensor_count, NULL, NULL);
+    free(qnn_inputs);
+    free(qnn_outputs);
+    if (status != QNN_SUCCESS) {
+        fprintf(stderr, "backend_qnn_api: multi-tensor QnnGraph_execute failed (0x%lx)\n",
                 (unsigned long)status);
         return -1;
     }

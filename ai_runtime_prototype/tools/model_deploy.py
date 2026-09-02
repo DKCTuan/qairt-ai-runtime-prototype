@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -29,6 +30,19 @@ BACKEND_LIBS = {
     'gpu': 'libQnnGpu.so',
     'htp': 'libQnnHtp.so',
 }
+
+
+def htp_runtime_paths(qairt_root: Path, target: str, htp_arch: str):
+    """Return the AP-side Stub and Hexagon-side Skel for one HTP architecture."""
+    normalized = htp_arch.lower().removeprefix('v')
+    if not normalized.isdigit():
+        fail(f'invalid HTP architecture {htp_arch!r}; expected for example v73')
+    arch = f'V{normalized}'
+    return {
+        'arch': arch,
+        'stub': qairt_root / 'lib' / target / f'libQnnHtp{arch}Stub.so',
+        'skel': qairt_root / 'lib' / f'hexagon-v{normalized}' / 'unsigned' / f'libQnnHtp{arch}Skel.so',
+    }
 
 
 def discover_qairt_root() -> Path:
@@ -211,6 +225,7 @@ def command_doctor(args):
     """Read-only preflight before spending time converting or deploying a model."""
     qairt_root = Path(args.qairt_root).expanduser().resolve()
     paths = qairt_paths(qairt_root, args.target)
+    host_paths = qairt_paths(qairt_root, DEFAULT_TARGET)
     checks = []
 
     def check(name, path, file_expected=True, required=True, hint=None):
@@ -224,34 +239,48 @@ def command_doctor(args):
     check('QAIRT root', qairt_root, file_expected=False)
     check('target bin directory', paths['bin'], file_expected=False)
     check('target lib directory', paths['lib'], file_expected=False)
-    check('qairt-converter', paths['qairt_converter'])
-    check('qnn-context-binary-generator', paths['qnn_context_binary_generator'])
-    check('qnn-net-run', paths['qnn_net_run'])
     check('libQnnSystem.so', paths['qnn_system'])
-    check('libQnnModelDlc.so', paths['qnn_model_dlc'])
     check(f'libQnn{args.backend.capitalize()}.so',
           backend_lib_path(qairt_root, args.target, args.backend))
+
+    if args.backend == 'htp' and args.htp_arch:
+        htp_paths = htp_runtime_paths(qairt_root, args.target, args.htp_arch)
+        check(f'HTP {htp_paths["arch"]} Stub', htp_paths['stub'])
+        check(f'HTP {htp_paths["arch"]} Skel', htp_paths['skel'])
 
     if args.model:
         model = Path(args.model).expanduser().resolve()
         check('input model', model)
         extension = model.suffix.lower()
         if extension == '.onnx':
-            check('qnn-onnx-converter', paths['qnn_onnx_converter'], required=False)
+            check('host qairt-converter', host_paths['qairt_converter'])
+            check('host qnn-onnx-converter', host_paths['qnn_onnx_converter'], required=False)
+            check('host qnn-context-binary-generator', host_paths['qnn_context_binary_generator'])
         elif extension == '.tflite':
-            check('qnn-tflite-converter', paths['qnn_tflite_converter'], required=False)
+            check('host qairt-converter', host_paths['qairt_converter'])
+            check('host qnn-tflite-converter', host_paths['qnn_tflite_converter'], required=False)
+            check('host qnn-context-binary-generator', host_paths['qnn_context_binary_generator'])
         elif extension in ('.pt', '.pth'):
-            check('qnn-pytorch-converter', paths['qnn_pytorch_converter'])
+            check('host qnn-pytorch-converter', host_paths['qnn_pytorch_converter'])
+            check('host qnn-context-binary-generator', host_paths['qnn_context_binary_generator'])
             is_torchscript = model.is_file() and is_torchscript_archive(model)
             checks.append({
                 'name': 'TorchScript archive', 'path': str(model), 'required': True,
                 'ok': is_torchscript,
                 'hint': 'export a training checkpoint with torch.jit.trace/script before conversion',
             })
-        elif extension != '.dlc':
+        elif extension == '.dlc':
+            check('host qnn-context-binary-generator', host_paths['qnn_context_binary_generator'])
+        elif extension == '.bin':
+            checks.append({
+                'name': 'context binary artifact', 'path': str(model), 'required': True,
+                'ok': model.is_file(),
+                'hint': 'binary compatibility with the board is validated only at target runtime',
+            })
+        else:
             checks.append({
                 'name': 'supported model extension', 'path': extension or '<none>', 'required': True,
-                'ok': False, 'hint': 'use ONNX, TFLite, TorchScript .pt/.pth, or DLC',
+                'ok': False, 'hint': 'use ONNX, TFLite, TorchScript .pt/.pth, DLC, or a QNN context .bin',
             })
 
     missing = [item for item in checks if item['required'] and not item['ok']]
@@ -260,7 +289,9 @@ def command_doctor(args):
         warnings.append('This target can be prepared, but run-api executes only local x86_64 binaries. '
                         'Copy artifacts and run them on the matching device.')
     if args.backend == 'htp':
-        warnings.append('HTP preflight cannot validate the target SoC, firmware, skeleton library, or graph partition. '
+        if not args.htp_arch:
+            warnings.append('Pass --htp-arch (for example v73) to also validate the matching Stub and Skel files.')
+        warnings.append('HTP preflight cannot validate the target SoC, firmware, driver, or graph partition. '
                         'Validate those on the physical Qualcomm device.')
     result = {
         'status': 'ready' if not missing else 'not_ready',
@@ -271,6 +302,117 @@ def command_doctor(args):
     if missing:
         raise SystemExit(2)
     return result
+
+
+def copy_into_bundle(source: Path, destination_dir: Path, label: str):
+    """Copy one required deployment file; no glob means no accidental payload."""
+    ensure_file(source, label)
+    if source.name in ('.', '..') or any(
+            not (character.isalnum() or character in '._-') for character in source.name):
+        fail(f'{label} filename contains shell-unsafe characters: {source.name!r}; rename it first')
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / source.name
+    shutil.copy2(source, destination)
+    return destination
+
+
+def sha256_file(path: Path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def command_package_target(args):
+    """Create a reproducible QAIRT Linux bundle without connecting to a device.
+
+    Qualcomm HTP needs application-processor libraries plus an architecture-
+    matched Hexagon Skel. Keeping both in a manifest makes ABI/HTP mismatches
+    visible before a user copies anything to a physical board.
+    """
+    qairt_root = Path(args.qairt_root).expanduser().resolve()
+    artifact = Path(args.artifact).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    ensure_file(artifact, 'deployment artifact')
+    if args.artifact_kind != 'context-binary':
+        fail('package-target currently packages the direct QNN API runtime and therefore requires '
+             '--artifact-kind context-binary; DLC and TFLite need different entrypoints/libraries')
+    if output.exists():
+        fail(f'output bundle already exists: {output}; choose a new path to avoid overwriting it')
+
+    paths = qairt_paths(qairt_root, args.target)
+    app_dir, lib_dir = output / 'app', output / 'lib'
+    model_dir, skel_dir = output / 'model', output / 'skel'
+    copied_artifact = copy_into_bundle(artifact, model_dir, 'deployment artifact')
+    copied_backend = copy_into_bundle(backend_lib_path(qairt_root, args.target, args.backend),
+                                      lib_dir, f'{args.backend} backend library')
+    copied_system = copy_into_bundle(paths['qnn_system'], lib_dir, 'QNN System library')
+    copied_app = None
+    if args.app:
+        copied_app = copy_into_bundle(Path(args.app).expanduser().resolve(), app_dir, 'application binary')
+        copied_app.chmod(copied_app.stat().st_mode | 0o111)
+
+    htp = None
+    if args.backend == 'htp':
+        if not args.htp_arch:
+            fail('--htp-arch (for example v73) is required when --backend htp')
+        htp_paths = htp_runtime_paths(qairt_root, args.target, args.htp_arch)
+        htp = {
+            'architecture': htp_paths['arch'],
+            'stub': str(copy_into_bundle(htp_paths['stub'], lib_dir, 'HTP Stub library').relative_to(output)),
+            'skel': str(copy_into_bundle(htp_paths['skel'], skel_dir, 'HTP Skel library').relative_to(output)),
+        }
+
+    entrypoint = f'./app/{copied_app.name}' if copied_app else None
+    run_script = output / 'run.sh'
+    lines = [
+        '#!/bin/sh', 'set -eu',
+        'ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
+        'export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
+        'export DL_QNN_SYSTEM_LIB="$ROOT/lib/libQnnSystem.so"',
+        f'export DL_QNN_BACKEND_LIB="$ROOT/lib/{copied_backend.name}"',
+        f'export DL_MODEL_PATH="$ROOT/model/{copied_artifact.name}"',
+    ]
+    if htp:
+        # QNN HTP/Hexagon lookup uses an ADSP search path.  Use ';' rather
+        # than ':' because it is consumed by the DSP loader, not ld.so.
+        lines.append('export ADSP_LIBRARY_PATH="$ROOT/skel${ADSP_LIBRARY_PATH:+;$ADSP_LIBRARY_PATH}"')
+    if entrypoint:
+        lines.append(f'exec "$ROOT/{entrypoint}" "$@"')
+    else:
+        lines.extend([
+            'echo "Bundle has no application binary. Re-run package-target with --app <target-built binary>." >&2',
+            'exit 64',
+        ])
+    run_script.write_text('\n'.join(lines) + '\n')
+    run_script.chmod(0o755)
+
+    payload_files = [copied_artifact, copied_backend, copied_system]
+    if copied_app:
+        payload_files.append(copied_app)
+    if htp:
+        payload_files.extend([output / htp['stub'], output / htp['skel']])
+    manifest = {
+        'format_version': 1,
+        'artifact': {'path': str(copied_artifact.relative_to(output)), 'kind': args.artifact_kind},
+        'target': args.target,
+        'backend': args.backend,
+        'application': str(copied_app.relative_to(output)) if copied_app else None,
+        'libraries': [str(copied_backend.relative_to(output)), str(copied_system.relative_to(output))],
+        'sha256': {str(path.relative_to(output)): sha256_file(path) for path in payload_files},
+        'htp': htp,
+        'run_script': 'run.sh',
+        'notes': [
+            'Copy the complete directory only to a board with the exact target ABI.',
+            'For HTP, install the Skel only through the board/BSP-approved DSP filesystem path.',
+            'Successful launch does not prove full graph delegation; inspect target logs and profiling.',
+        ],
+    }
+    (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(json.dumps({'status': 'success', 'bundle': str(output),
+                      'manifest': str(output / 'manifest.json')}, indent=2))
+    return manifest
 
 
 def is_torchscript_archive(path: Path) -> bool:
@@ -390,6 +532,21 @@ def read_float32(path: Path):
     return list(struct.unpack('<' + 'f' * (len(data) // 4), data))
 
 
+def read_tensor_values(path: Path, dtype='float32', scale=1.0, zero_point=0):
+    data = path.read_bytes()
+    if dtype == 'float32':
+        return read_float32(path)
+    if scale <= 0.0:
+        fail(f'quantized output scale must be positive, got {scale}')
+    if dtype == 'uint8':
+        raw = data
+    elif dtype == 'int8':
+        raw = struct.unpack(f'<{len(data)}b', data)
+    else:
+        fail(f'unsupported tensor dtype: {dtype}')
+    return [scale * (float(value) - float(zero_point)) for value in raw]
+
+
 def command_run_host(args):
     qairt_root = Path(args.qairt_root)
     paths = qairt_paths(qairt_root)
@@ -443,14 +600,16 @@ def read_npy_float32(path: Path):
 def command_validate(args):
     command_run_host(args)
     output_raw = Path(args.output_dir).resolve() / 'Result_0' / f'{args.output_name}.raw'
-    qnn = read_float32(output_raw)
+    qnn = read_tensor_values(output_raw, args.output_dtype, args.output_scale,
+                             args.output_zero_point)
     ref_path = Path(args.reference).resolve()
     ensure_file(ref_path, 'reference output')
 
     if ref_path.suffix.lower() == '.npy':
         ref_values = read_npy_float32(ref_path)
     elif ref_path.suffix.lower() == '.raw':
-        ref_values = read_float32(ref_path)
+        ref_values = read_tensor_values(ref_path, args.reference_dtype,
+                                        args.reference_scale, args.reference_zero_point)
     else:
         fail('reference must be .npy or .raw')
 
@@ -460,7 +619,17 @@ def command_validate(args):
     mean_abs_diff = sum(diffs) / len(diffs) if diffs else float('inf')
     qnn_argmax = max(range(len(qnn)), key=lambda i: qnn[i]) if qnn else -1
     ref_argmax = max(range(len(ref_values)), key=lambda i: ref_values[i]) if ref_values else -1
-    passed = len(qnn) == len(ref_values) and max_abs_diff <= args.tolerance and qnn_argmax == ref_argmax
+    relative_failures = [
+        i for i in range(n)
+        if diffs[i] > args.tolerance + args.relative_tolerance * abs(ref_values[i])
+    ]
+    dot = sum(qnn[i] * ref_values[i] for i in range(n))
+    qnn_norm = sum(qnn[i] * qnn[i] for i in range(n)) ** 0.5
+    ref_norm = sum(ref_values[i] * ref_values[i] for i in range(n)) ** 0.5
+    cosine_similarity = dot / (qnn_norm * ref_norm) if qnn_norm > 0.0 and ref_norm > 0.0 else None
+    passed = len(qnn) == len(ref_values) and not relative_failures
+    if args.require_argmax:
+        passed = passed and qnn_argmax == ref_argmax
 
     result = {
         'status': 'success' if passed else 'failed',
@@ -469,9 +638,14 @@ def command_validate(args):
         'reference_shape': [len(ref_values)],
         'max_abs_diff': max_abs_diff,
         'mean_abs_diff': mean_abs_diff,
+        'cosine_similarity': cosine_similarity,
+        'mismatch_count': len(relative_failures),
         'qnn_argmax': qnn_argmax,
         'reference_argmax': ref_argmax,
         'tolerance': args.tolerance,
+        'relative_tolerance': args.relative_tolerance,
+        'output_dtype': args.output_dtype,
+        'reference_dtype': args.reference_dtype,
     }
     print(json.dumps(result, indent=2))
     if not passed:
@@ -576,6 +750,7 @@ def command_run_api(args):
     if args.graph_name:
         env['DL_GRAPH_NAME'] = args.graph_name
     env['DL_QNN_BACKEND_LIB'] = str(backend_lib)
+    env['DL_QNN_SYSTEM_LIB'] = str(paths['qnn_system'])
     old_ld = env.get('LD_LIBRARY_PATH', '')
     env['LD_LIBRARY_PATH'] = f"{paths['lib']}:{old_ld}" if old_ld else str(paths['lib'])
 
@@ -601,6 +776,101 @@ def command_run_api(args):
     }
     print(json.dumps(result_with_limited_scores(
         result, getattr(args, 'max_print_scores', 100)), indent=2))
+    return result
+
+
+def command_inspect_context(args):
+    """Build the direct-QNN metadata inspector and emit machine-readable JSON."""
+    qairt_root = Path(args.qairt_root).expanduser().resolve()
+    if args.target != DEFAULT_TARGET:
+        fail(f'inspect-context executes locally and supports only {DEFAULT_TARGET}')
+    context_bin = Path(args.context).expanduser().resolve()
+    ensure_file(context_bin, 'context binary')
+    repo_root = Path(__file__).resolve().parent.parent
+    paths = qairt_paths(qairt_root, args.target)
+    backend_lib = backend_lib_path(qairt_root, args.target, args.backend)
+    ensure_file(backend_lib, f'{args.backend} backend library')
+    ensure_file(paths['qnn_system'], 'QNN System library')
+
+    work_dir = Path(args.work_dir).expanduser().resolve()
+    build_dir = work_dir / 'build'
+    run(['make', 'BACKEND=qnn_api', f'DL_QAIRT_ROOT={qairt_root}',
+         f'BUILD_DIR={build_dir}', 'inspect'], cwd=repo_root,
+        log_path=work_dir / 'make.log')
+    inspector = build_dir / 'inspect_model'
+    ensure_file(inspector, 'inspect_model executable')
+
+    env = make_env(qairt_root, args.target)
+    env['DL_MODEL_PATH'] = str(context_bin)
+    env['DL_QNN_BACKEND_LIB'] = str(backend_lib)
+    env['DL_QNN_SYSTEM_LIB'] = str(paths['qnn_system'])
+    if args.graph_name:
+        env['DL_GRAPH_NAME'] = args.graph_name
+    proc = run_capture([str(inspector)], env=env, cwd=repo_root)
+    log_path = work_dir / 'inspect.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(f'--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\n')
+    if proc.returncode != 0:
+        fail(f'inspect_model exited with code {proc.returncode}, see log: {log_path}')
+    try:
+        metadata = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f'inspect_model returned invalid JSON ({exc}), see log: {log_path}')
+    result = {'status': 'success', 'context': str(context_bin), 'backend': args.backend,
+              'target': args.target, 'metadata': metadata, 'log_path': str(log_path)}
+    print(json.dumps(result, indent=2))
+    return result
+
+
+def command_run_context(args):
+    """Execute a Context Binary through the generic multi-tensor C API."""
+    qairt_root = Path(args.qairt_root).expanduser().resolve()
+    if args.target != DEFAULT_TARGET:
+        fail(f'run-context executes locally and supports only {DEFAULT_TARGET}')
+    context_bin = Path(args.context).expanduser().resolve()
+    ensure_file(context_bin, 'context binary')
+    input_paths = [Path(value).expanduser().resolve() for value in args.input_raw]
+    for index, path in enumerate(input_paths):
+        ensure_file(path, f'input tensor {index}')
+
+    repo_root = Path(__file__).resolve().parent.parent
+    paths = qairt_paths(qairt_root, args.target)
+    backend_lib = backend_lib_path(qairt_root, args.target, args.backend)
+    work_dir = Path(args.work_dir).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    build_dir = work_dir / 'build'
+    run(['make', 'BACKEND=qnn_api', f'DL_QAIRT_ROOT={qairt_root}',
+         f'BUILD_DIR={build_dir}', 'run-model'], cwd=repo_root,
+        log_path=work_dir / 'make.log')
+    executable = build_dir / 'run_model'
+    ensure_file(executable, 'run_model executable')
+
+    env = make_env(qairt_root, args.target)
+    env['DL_MODEL_PATH'] = str(context_bin)
+    env['DL_QNN_BACKEND_LIB'] = str(backend_lib)
+    env['DL_QNN_SYSTEM_LIB'] = str(paths['qnn_system'])
+    env['DL_OUTPUT_DIR'] = str(output_dir)
+    if args.graph_name:
+        env['DL_GRAPH_NAME'] = args.graph_name
+    for index, path in enumerate(input_paths):
+        env[f'DL_INPUT_{index}_RAW'] = str(path)
+
+    proc = run_capture([str(executable)], env=env, cwd=repo_root)
+    log_path = work_dir / 'run_context.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(f'--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\n')
+    if proc.returncode != 0:
+        fail(f'run_model exited with code {proc.returncode}, see log: {log_path}')
+    try:
+        execution = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f'run_model returned invalid JSON ({exc}), see log: {log_path}')
+    for item in execution.get('outputs', []):
+        item['path'] = str(output_dir / item['path'])
+    result = {'status': 'success', 'context': str(context_bin), 'backend': args.backend,
+              'target': args.target, **execution, 'log_path': str(log_path)}
+    print(json.dumps(result, indent=2))
     return result
 
 
@@ -752,7 +1022,21 @@ def build_parser():
     p.add_argument('model', nargs='?', metavar='MODEL')
     p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
     p.add_argument('--target', default=DEFAULT_TARGET)
+    p.add_argument('--htp-arch', help='Optional HTP architecture to validate Stub/Skel availability, e.g. v73')
     p.set_defaults(func=command_doctor)
+
+    p = sub.add_parser('package-target',
+                       help='Create a non-destructive Linux deployment bundle with QNN runtime libraries')
+    p.add_argument('--artifact', required=True,
+                   help='QNN Context Binary (.bin) to place in the direct-QNN runtime bundle')
+    p.add_argument('--artifact-kind', choices=['context-binary', 'dlc', 'tflite'], default='context-binary')
+    p.add_argument('--output', required=True, help='New bundle directory; must not already exist')
+    p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
+    p.add_argument('--target', required=True,
+                   help='QAIRT Linux ABI triplet, e.g. aarch64-oe-linux-gcc11.2')
+    p.add_argument('--htp-arch', help='Required for HTP: v68, v69, v73, v75, v79, ...')
+    p.add_argument('--app', help='Optional target-built runtime application to copy and execute via run.sh')
+    p.set_defaults(func=command_package_target)
 
     p = sub.add_parser('convert', help='Convert MODEL to .dlc; output defaults next to MODEL')
     p.add_argument('model_positional', nargs='?', metavar='MODEL')
@@ -802,6 +1086,14 @@ def build_parser():
     p.add_argument('--work-dir', default=str(DEFAULT_WORK_ROOT / 'validate_work'))
     p.add_argument('--log-level', default='error')
     p.add_argument('--tolerance', type=float, default=1e-5)
+    p.add_argument('--relative-tolerance', type=float, default=0.0)
+    p.add_argument('--output-dtype', choices=['float32', 'uint8', 'int8'], default='float32')
+    p.add_argument('--output-scale', type=float, default=1.0)
+    p.add_argument('--output-zero-point', type=int, default=0)
+    p.add_argument('--reference-dtype', choices=['float32', 'uint8', 'int8'], default='float32')
+    p.add_argument('--reference-scale', type=float, default=1.0)
+    p.add_argument('--reference-zero-point', type=int, default=0)
+    p.add_argument('--require-argmax', action=argparse.BooleanOptionalAction, default=True)
     p.set_defaults(func=command_validate)
 
     p = sub.add_parser('build-context', help='Build a QNN context binary (.bin) from a .dlc')
@@ -826,6 +1118,25 @@ def build_parser():
     p.add_argument('--max-print-scores', type=int, default=100,
                    help='Maximum scores emitted in JSON; validation still uses the full tensor')
     p.set_defaults(func=command_run_api)
+
+    p = sub.add_parser('inspect-context', help='Read graph tensor metadata from a QNN Context Binary')
+    p.add_argument('--context', required=True)
+    p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
+    p.add_argument('--target', default=DEFAULT_TARGET)
+    p.add_argument('--graph-name', default=None)
+    p.add_argument('--work-dir', default=str(DEFAULT_WORK_ROOT / 'inspect_context'))
+    p.set_defaults(func=command_inspect_context)
+
+    p = sub.add_parser('run-context', help='Run a QNN Context Binary with one or more raw input tensors')
+    p.add_argument('--context', required=True)
+    p.add_argument('--input-raw', action='append', required=True,
+                   help='Raw input in graph tensor order; repeat for every input')
+    p.add_argument('--output-dir', default=str(DEFAULT_WORK_ROOT / 'run_context_output'))
+    p.add_argument('--backend', choices=['cpu', 'gpu', 'htp'], default='cpu')
+    p.add_argument('--target', default=DEFAULT_TARGET)
+    p.add_argument('--graph-name', default=None)
+    p.add_argument('--work-dir', default=str(DEFAULT_WORK_ROOT / 'run_context'))
+    p.set_defaults(func=command_run_context)
 
     p = sub.add_parser('deploy', help='Chain convert -> build-context -> run-api (+ so sanh reference neu co)')
     p.add_argument('--model', required=True)
