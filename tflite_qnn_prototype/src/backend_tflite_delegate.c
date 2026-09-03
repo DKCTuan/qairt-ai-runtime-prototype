@@ -42,7 +42,9 @@
 #include <string.h>
 
 #include "tensorflow/lite/c/c_api.h"
+#ifndef DL_TFLITE_STATIC_CPU
 #include "tensorflow/lite/delegates/external/external_delegate.h"
+#endif
 
 #define DEFAULT_TFLITE_MODEL     "/home/congtuan/model_test/tflite_output/traffic_qos_model_float32.tflite"
 #define DEFAULT_QNN_DELEGATE_LIB "/home/congtuan/qairt_sdk/qairt/2.44.0.260225/lib/x86_64-linux-clang/libQnnTFLiteDelegate.so"
@@ -54,7 +56,9 @@
 static TfLiteModel *g_model                        = NULL;
 static TfLiteInterpreterOptions *g_interp_options  = NULL;
 static TfLiteInterpreter *g_interpreter            = NULL;
+#ifndef DL_TFLITE_STATIC_CPU
 static TfLiteDelegate *g_delegate                  = NULL;
+#endif
 
 static int g_backend_ready = 0;
 static int g_using_delegate = 0;
@@ -63,6 +67,14 @@ static int g_using_delegate = 0;
  * doan qua log rai rac - in ra 1 banner CANH BAO ro rang o cuoi backend_init()
  * thay vi de nguoi dung tuong nham "chay duoc" = "chay tren HTP/QNN". */
 static const char *g_fallback_reason = NULL;
+
+/* standalone-tflite supplies these symbols from generated model_data.c.
+ * The model bytes remain valid for the lifetime of the process, satisfying
+ * TfLiteModelCreate's ownership requirement. */
+#ifdef DL_TFLITE_STATIC_CPU
+extern const unsigned char kEmbeddedModel[];
+extern const size_t kEmbeddedModelSize;
+#endif
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -92,6 +104,7 @@ static int readable_file_exists(const char *path)
  * du chinh thuc cua Qualcomm (vd:
  * "backend_type:htp;library_path:/usr/lib/libQnnHtp.so;skel_library_dir:/usr/lib/rfsa/adsp"),
  * roi parse tach tung cap de goi options.insert() cua external_delegate.h. */
+#ifndef DL_TFLITE_STATIC_CPU
 static int apply_external_delegate_options(TfLiteExternalDelegateOptions *options,
                                            const char *backend_type,
                                            const char *backend_lib,
@@ -127,6 +140,7 @@ static int apply_external_delegate_options(TfLiteExternalDelegateOptions *option
     free(buf);
     return 0;
 }
+#endif
 
 static int create_plain_interpreter(void)
 {
@@ -134,10 +148,12 @@ static int create_plain_interpreter(void)
         TfLiteInterpreterOptionsDelete(g_interp_options);
         g_interp_options = NULL;
     }
+#ifndef DL_TFLITE_STATIC_CPU
     if (g_delegate != NULL) {
         TfLiteExternalDelegateDelete(g_delegate);
         g_delegate = NULL;
     }
+#endif
 
     g_interp_options = TfLiteInterpreterOptionsCreate();
     if (g_interp_options == NULL) {
@@ -159,6 +175,27 @@ static int create_plain_interpreter(void)
 
 int backend_init(void)
 {
+#ifdef DL_TFLITE_STATIC_CPU
+    /* Deliberately CPU-only.  A generic board has no Qualcomm QNN driver,
+     * and the standalone ELF must not depend on an external Delegate .so. */
+    g_fallback_reason = NULL;
+    g_model = TfLiteModelCreate(kEmbeddedModel, kEmbeddedModelSize);
+    if (g_model == NULL) {
+        fprintf(stderr, "backend_tflite_delegate: embedded TFLite model is invalid\n");
+        return -1;
+    }
+    g_interp_options = TfLiteInterpreterOptionsCreate();
+    g_interpreter = g_interp_options == NULL ? NULL : TfLiteInterpreterCreate(g_model, g_interp_options);
+    if (g_interpreter == NULL || TfLiteInterpreterAllocateTensors(g_interpreter) != kTfLiteOk) {
+        fprintf(stderr, "backend_tflite_delegate: cannot create/allocate static CPU interpreter\n");
+        return -1;
+    }
+    g_using_delegate = 0;
+    g_backend_ready = 1;
+    fprintf(stderr, "backend_tflite_delegate: ready mode=tflite_cpu_static model_bytes=%zu\n",
+            kEmbeddedModelSize);
+    return 0;
+#else
     g_fallback_reason = NULL;
     const char *model_path   = env_or_default("DL_TFLITE_MODEL_PATH", DEFAULT_TFLITE_MODEL);
     const char *delegate_lib = env_or_default("DL_QNN_DELEGATE_LIB", DEFAULT_QNN_DELEGATE_LIB);
@@ -296,6 +333,7 @@ int backend_init(void)
 
     g_backend_ready = 1;
     return 0;
+#endif
 }
 
 /* THEM MOI: doc dtype that cua tensor (kTfLiteUInt8/kTfLiteInt8/kTfLiteFloat32)
@@ -560,10 +598,12 @@ void backend_deinit(void)
     }
     /* The interpreter may still refer to delegate-owned state, so destroy
      * it before destroying the delegate. */
+#ifndef DL_TFLITE_STATIC_CPU
     if (g_delegate != NULL) {
         TfLiteExternalDelegateDelete(g_delegate);
         g_delegate = NULL;
     }
+#endif
     if (g_interp_options != NULL) {
         TfLiteInterpreterOptionsDelete(g_interp_options);
         g_interp_options = NULL;

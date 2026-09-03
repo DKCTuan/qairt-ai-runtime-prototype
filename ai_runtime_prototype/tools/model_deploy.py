@@ -1013,6 +1013,104 @@ def command_deploy(args):
             result, getattr(args, 'max_print_scores', 100)), indent=2))
 
 
+def _write_embedded_model_c(model: Path, destination: Path):
+    """Emit a C object instead of relying on objcopy being installed for ARM64."""
+    data = model.read_bytes()
+    with destination.open('w', encoding='ascii') as stream:
+        stream.write('#include <stddef.h>\n')
+        stream.write('const unsigned char kEmbeddedModel[] = {\n')
+        for offset in range(0, len(data), 12):
+            stream.write('  ' + ', '.join(f'0x{byte:02x}' for byte in data[offset:offset + 12]) + ',\n')
+        stream.write('};\n')
+        stream.write(f'const size_t kEmbeddedModelSize = {len(data)}u;\n')
+
+
+def command_standalone_tflite(args):
+    """Build one static ARM64 ELF: embedded .tflite + TFLite CPU runtime.
+
+    This intentionally does not package QNN/Delegate libraries.  It is the
+    deployment route for a generic ARM Linux target (including the iGate),
+    where QNN drivers are absent.  Inputs remain files/sensors at runtime;
+    only the model and inference runtime are compiled into the executable.
+    """
+    model = Path(args.model).expanduser().resolve()
+    tensorflow_root = Path(args.tensorflow_root).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    ensure_file(model, 'TFLite model')
+    if model.suffix.lower() != '.tflite':
+        fail('standalone-tflite accepts a .tflite file; convert ONNX/PT to TFLite before this CPU-only route')
+    if not (tensorflow_root / 'WORKSPACE').is_file():
+        fail(f'TensorFlow workspace not found: {tensorflow_root}')
+    tflite_project = Path(__file__).resolve().parents[2] / 'tflite_qnn_prototype'
+    runner_template = tflite_project / 'tools' / 'standalone_api_runner.c'
+    app_source = Path(args.app_source).expanduser().resolve() if args.app_source else runner_template
+    ensure_file(runner_template, 'standalone runner template')
+    if output.exists() and not args.force:
+        fail(f'output already exists: {output} (use --force to replace it)')
+
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()[:16]
+    package_name = f'model_deploy_standalone_{digest}'
+    package_dir = tensorflow_root / package_name
+    if package_dir.exists():
+        shutil.rmtree(package_dir)
+    package_dir.mkdir()
+    try:
+        # Compile the existing AI Runtime layer into the payload.  The
+        # application template includes ai_runtime.h only; TensorFlow Lite
+        # remains an implementation detail of backend_tflite_delegate.c.
+        for source, destination in (
+            (app_source, 'standalone_runner.c'),
+            (tflite_project / 'src' / 'ai_runtime.c', 'ai_runtime.c'),
+            (tflite_project / 'src' / 'backend_tflite_delegate.c', 'backend_tflite_delegate.c'),
+            (tflite_project / 'src' / 'backend.h', 'backend.h'),
+            (tflite_project / 'include' / 'ai_runtime.h', 'ai_runtime.h'),
+        ):
+            ensure_file(source, 'standalone runtime source')
+            shutil.copy2(source, package_dir / destination)
+        _write_embedded_model_c(model, package_dir / 'model_data.c')
+        (package_dir / 'BUILD').write_text(
+            'cc_binary(\n'
+            '    name = "runner",\n'
+            '    srcs = ["standalone_runner.c", "ai_runtime.c", "backend_tflite_delegate.c", "model_data.c", "ai_runtime.h", "backend.h"],\n'
+            '    deps = ["//tensorflow/lite/c:c_api"],\n'
+            '    copts = ["-I.", "-DDL_TFLITE_STATIC_CPU"],\n'
+            '    linkstatic = True,\n'
+            '    # Strip symbols in the target linker: the payload is copied to\n'
+            '    # a constrained device, not used as a host-side debug binary.\n'
+            '    linkopts = ["-static", "-s", "-lm"],\n'
+            ')\n', encoding='utf-8')
+        bazel = args.bazel or str(Path.home() / 'bin' / 'bazelisk')
+        command = [bazel, 'build', '-c', 'opt']
+        if args.target_config:
+            command.append(f'--config={args.target_config}')
+        command.append(f'//{package_name}:runner')
+        run(command, cwd=tensorflow_root, log_path=output.parent / f'{output.name}.build.log')
+        built = tensorflow_root / 'bazel-bin' / package_name / 'runner'
+        ensure_file(built, 'static standalone executable')
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.exists():
+            output.unlink()
+        shutil.copy2(built, output)
+        output.chmod(output.stat().st_mode | 0o111)
+        readelf = shutil.which('readelf')
+        if readelf:
+            check = subprocess.run([readelf, '-d', str(output)], capture_output=True, text=True)
+            if check.returncode != 0 or 'NEEDED' in check.stdout:
+                fail('result is not fully static; see build log and target toolchain configuration')
+        print(json.dumps({
+            'status': 'success',
+            'mode': 'tflite_cpu_static',
+            'model_embedded': str(model),
+            'executable': str(output),
+            'usage': (f'{output.name} --output-dir /tmp/results INPUT_0.raw [INPUT_1.raw ...]'
+                      if not args.app_source else f'{output.name}  # behavior defined by --app-source'),
+            'note': 'CPU-only: no QNN/HTP acceleration and no external .so/.tflite is required on target.',
+        }, indent=2))
+    finally:
+        if not args.keep_build_dir:
+            shutil.rmtree(package_dir, ignore_errors=True)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description='Model deploy helper for QAIRT/QNN prototype')
     parser.add_argument('--qairt-root', default=str(DEFAULT_QAIRT_ROOT))
@@ -1037,6 +1135,22 @@ def build_parser():
     p.add_argument('--htp-arch', help='Required for HTP: v68, v69, v73, v75, v79, ...')
     p.add_argument('--app', help='Optional target-built runtime application to copy and execute via run.sh')
     p.set_defaults(func=command_package_target)
+
+    p = sub.add_parser('standalone-tflite',
+                       help='Build one static ARM64 ELF with an embedded .tflite model (CPU only)')
+    p.add_argument('--model', required=True, help='Source .tflite model to compile into the executable')
+    p.add_argument('--output', required=True, help='Output executable path, for example dist/model_runner')
+    p.add_argument('--tensorflow-root', default=str(Path.home() / 'tensorflow'),
+                   help='TensorFlow v2.15 source tree used to statically link the TFLite C API')
+    p.add_argument('--bazel', default=None, help='Bazelisk/Bazel executable (default: ~/bin/bazelisk)')
+    p.add_argument('--target-config', default='elinux_aarch64',
+                   help='TensorFlow Bazel config for the target; use elinux_aarch64 for ARM64 Linux')
+    p.add_argument('--app-source', default=None,
+                   help='Optional C file containing main(); it may include only ai_runtime.h and call dl_* APIs')
+    p.add_argument('--force', action='store_true', help='Replace an existing output executable')
+    p.add_argument('--keep-build-dir', action='store_true',
+                   help='Keep the temporary Bazel package under TensorFlow source for troubleshooting')
+    p.set_defaults(func=command_standalone_tflite)
 
     p = sub.add_parser('convert', help='Convert MODEL to .dlc; output defaults next to MODEL')
     p.add_argument('model_positional', nargs='?', metavar='MODEL')
