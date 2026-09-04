@@ -491,7 +491,7 @@ def command_convert(args):
             input_dims = getattr(args, 'pytorch_input_dim', None) or []
             if not input_dims:
                 fail('PyTorch conversion requires --pytorch-input-dim INPUT_NAME DIMS, for example '
-                     '--pytorch-input-dim input 1,240')
+                     '--pytorch-input-dim input 1,80,3')
             cmd = [python, paths['qnn_pytorch_converter'], '--input_network', model, '--output_path', output]
             for item in input_dims:
                 cmd.extend(['--input_dim', item[0], item[1]])
@@ -521,6 +521,8 @@ def command_convert(args):
     }
     print(json.dumps(result, indent=2))
     return result
+
+
 def write_input_list(input_name: str, input_raw: Path, input_list: Path):
     input_list.write_text(f'{input_name}:={input_raw}\n')
 
@@ -1111,6 +1113,129 @@ def command_standalone_tflite(args):
             shutil.rmtree(package_dir, ignore_errors=True)
 
 
+def command_static_library(args):
+    """Build a reusable static archive containing one embedded TFLite model.
+
+    The archive exports ai_model_init/predict/deinit.  TensorFlow Lite's
+    transitive static archive is copied alongside it so an application can
+    link both archives without knowing the generated Bazel package name.
+    """
+    model = Path(args.model).expanduser().resolve()
+    tensorflow_root = Path(args.tensorflow_root).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    ensure_file(model, 'TFLite model')
+    if model.suffix.lower() != '.tflite':
+        fail('static-library accepts a .tflite file')
+    if not (tensorflow_root / 'WORKSPACE').is_file():
+        fail(f'TensorFlow workspace not found: {tensorflow_root}')
+    if output.exists() and not args.force:
+        fail(f'output already exists: {output} (use --force to replace it)')
+
+    tflite_project = Path(__file__).resolve().parents[2] / 'tflite_qnn_prototype'
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()[:16]
+    package_name = f'model_deploy_library_{digest}'
+    package_dir = tensorflow_root / package_name
+    if package_dir.exists():
+        shutil.rmtree(package_dir)
+    package_dir.mkdir()
+    try:
+        for source, destination in (
+            (tflite_project / 'src' / 'ai_model.c', 'ai_model.c'),
+            (tflite_project / 'src' / 'ai_runtime.c', 'ai_runtime.c'),
+            (tflite_project / 'src' / 'backend_tflite_delegate.c', 'backend_tflite_delegate.c'),
+            (tflite_project / 'src' / 'backend.h', 'backend.h'),
+            (tflite_project / 'include' / 'ai_model.h', 'ai_model.h'),
+            (tflite_project / 'include' / 'ai_runtime.h', 'ai_runtime.h'),
+        ):
+            ensure_file(source, 'static library source')
+            shutil.copy2(source, package_dir / destination)
+        _write_embedded_model_c(model, package_dir / 'model_data.c')
+        if args.shared:
+            build_rule = (
+                'cc_binary(\n'
+                '    name = "ai_model",\n'
+                '    srcs = ["ai_model.c", "ai_runtime.c", "backend_tflite_delegate.c", "model_data.c", "ai_model.h", "ai_runtime.h", "backend.h"],\n'
+                '    deps = ["//tensorflow/lite/c:c_api"],\n'
+                '    copts = ["-I.", "-DDL_TFLITE_STATIC_CPU"],\n'
+                '    # TFLite is implemented in C++; embed its C++/GCC runtime so\n'
+                '    # the deployed .so works on minimal ARM64 firmware images.\n'
+                '    # The embedded ARM toolchain adds -lstdc++ after ordinary\n'
+                '    # linkopts.  Select its static archive explicitly as well, so\n'
+                '    # the final .so does not require libstdc++.so.6 on the board.\n'
+                '    linkopts = [\n'
+                '        "-Wl,--as-needed",\n'
+                '        "-static-libstdc++", "-static-libgcc",\n'
+                '        "-Wl,--push-state,-Bstatic", "-lstdc++",\n'
+                '        "-Wl,--pop-state",\n'
+                '    ],\n'
+                '    linkshared = True,\n'
+                ')\n')
+        else:
+            build_rule = (
+                'cc_library(\n'
+                '    name = "ai_model",\n'
+                '    srcs = ["ai_model.c", "ai_runtime.c", "backend_tflite_delegate.c", "model_data.c"],\n'
+                '    hdrs = ["ai_model.h", "ai_runtime.h", "backend.h"],\n'
+                '    deps = ["//tensorflow/lite/c:c_api"],\n'
+                '    copts = ["-I.", "-DDL_TFLITE_STATIC_CPU"],\n'
+                '    linkstatic = True,\n'
+                ')\n')
+        (package_dir / 'BUILD').write_text(build_rule, encoding='utf-8')
+        bazel = args.bazel or str(Path.home() / 'bin' / 'bazelisk')
+        command = [bazel, 'build', '-c', 'opt']
+        if args.aarch64_toolchain:
+            toolchain = Path(args.aarch64_toolchain).expanduser().resolve()
+            ensure_file(toolchain / 'bin' / 'aarch64-none-linux-gnu-gcc',
+                        'ARM64 cross compiler')
+            if not ((toolchain / 'BUILD').is_file() or
+                    (toolchain / 'BUILD.bazel').is_file()):
+                fail(f'Bazel repository BUILD file not found in toolchain: {toolchain}')
+            command.append(f'--override_repository=aarch64_linux_toolchain={toolchain}')
+            if args.aarch64_toolchain_config:
+                toolchain_config = Path(args.aarch64_toolchain_config).expanduser().resolve()
+                ensure_file(toolchain_config / 'cc_config.bzl',
+                            'Bazel ARM64 toolchain configuration')
+                if not ((toolchain_config / 'BUILD').is_file() or
+                        (toolchain_config / 'BUILD.bazel').is_file()):
+                    fail('Bazel toolchain configuration BUILD file not found: '
+                         f'{toolchain_config}')
+                command.append(
+                    '--override_repository=local_config_embedded_arm='
+                    f'{toolchain_config}')
+        if not args.shared:
+            command.extend(['--define', 'framework_shared_object=false'])
+        if args.target_config:
+            command.append(f'--config={args.target_config}')
+        command.extend([f'//{package_name}:ai_model', '//tensorflow/lite:tflite_with_xnnpack_optional'])
+        run(command, cwd=tensorflow_root, log_path=output.parent / f'{output.name}.build.log')
+        built_name = 'libai_model.so' if args.shared else 'libai_model.a'
+        built = tensorflow_root / 'bazel-bin' / package_name / built_name
+        ensure_file(built, 'AI model library')
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.exists():
+            output.unlink()
+        shutil.copy2(built, output)
+        if not args.shared:
+            tflite_archive = (tensorflow_root / 'bazel-bin' / 'tensorflow' / 'lite' /
+                              'libtflite_with_xnnpack_optional.a')
+            if tflite_archive.is_file():
+                shutil.copy2(tflite_archive, output.parent / 'libtflite_with_xnnpack_optional.a')
+        shutil.copy2(tflite_project / 'include' / 'ai_model.h', output.parent / 'ai_model.h')
+        shutil.copy2(tflite_project / 'include' / 'ai_runtime.h', output.parent / 'ai_runtime.h')
+        print(json.dumps({
+            'status': 'success',
+            'mode': 'tflite_cpu_shared_library' if args.shared else 'tflite_cpu_static_library',
+            'library': str(output),
+            'headers': [str(output.parent / 'ai_model.h'), str(output.parent / 'ai_runtime.h')],
+            'note': ('Model bytes and TFLite runtime are embedded in the shared library; '
+                     'link the application with -lai_model.' if args.shared else
+                     'Static archive requires a separately linkable TFLite C API archive.'),
+        }, indent=2))
+    finally:
+        if not args.keep_build_dir:
+            shutil.rmtree(package_dir, ignore_errors=True)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description='Model deploy helper for QAIRT/QNN prototype')
     parser.add_argument('--qairt-root', default=str(DEFAULT_QAIRT_ROOT))
@@ -1152,6 +1277,25 @@ def build_parser():
                    help='Keep the temporary Bazel package under TensorFlow source for troubleshooting')
     p.set_defaults(func=command_standalone_tflite)
 
+    p = sub.add_parser('static-library',
+                       help='Build a reusable static archive with an embedded TFLite model')
+    p.add_argument('--model', required=True, help='Source .tflite model')
+    p.add_argument('--output', required=True, help='Output archive, for example dist/libai_model.a')
+    p.add_argument('--tensorflow-root', default=str(Path.home() / 'tensorflow'))
+    p.add_argument('--bazel', default=None)
+    p.add_argument('--target-config', default='elinux_aarch64')
+    p.add_argument('--aarch64-toolchain', default=None,
+                   help='Bazel repository containing an ARM64 GNU toolchain; '
+                        'use a sysroot no newer than the target glibc')
+    p.add_argument('--aarch64-toolchain-config', default=None,
+                   help='Bazel local_config_embedded_arm repository matching '
+                        'the selected ARM64 compiler version')
+    p.add_argument('--shared', action='store_true',
+                   help='Build libai_model.so containing the model and TFLite runtime')
+    p.add_argument('--force', action='store_true')
+    p.add_argument('--keep-build-dir', action='store_true')
+    p.set_defaults(func=command_static_library)
+
     p = sub.add_parser('convert', help='Convert MODEL to .dlc; output defaults next to MODEL')
     p.add_argument('model_positional', nargs='?', metavar='MODEL')
     p.add_argument('--model', help='Backward-compatible alternative to positional MODEL')
@@ -1159,7 +1303,7 @@ def build_parser():
     p.add_argument('--converter', choices=['auto', 'qairt', 'qnn', 'snpe'], default='auto')
     p.add_argument('--source-model-input-shape', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'))
     p.add_argument('--pytorch-input-dim', nargs=2, action='append', metavar=('INPUT_NAME', 'INPUT_DIMS'),
-                   help='Required for .pt/.pth TorchScript input, e.g. input 1,240')
+                   help='Required for .pt/.pth TorchScript input, e.g. input 1,80,3')
     p.add_argument('--out-tensor-node', action='append')
     p.add_argument('--extra-args', nargs=argparse.REMAINDER, default=[],
                    help='Arguments passed verbatim to the Qualcomm converter; place this option last')

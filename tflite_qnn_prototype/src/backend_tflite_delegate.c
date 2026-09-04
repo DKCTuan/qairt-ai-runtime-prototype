@@ -14,8 +14,8 @@
  *   - External Delegate Interface dung API C thuan (TfLiteInterpreterCreate,
  *     TfLiteInterpreterOptionsAddDelegate...), cung ho voi kien truc C cua
  *     ai_runtime.c/backend.h hien tai, va chinh Qualcomm dung co che nay cho
- *     benchmark_model tren Linux nhung (vi du OS "le", khong rieng Android)
- *     - phu hop thiet bi dich OpenWrt/musl libc cua du an nay hon.
+ *     benchmark_model tren embedded Linux (vi du OS "le", khong rieng
+ *     Android). Target van phai dung ABI/libc duoc QAIRT va BSP ho tro.
  *
  * YEU CAU MOI TRUONG (thieu 1 trong 2 cai duoi thi khong build duoc):
  *   1. TFLite C API library + header (libtensorflowlite_c.so +
@@ -63,9 +63,8 @@ static TfLiteDelegate *g_delegate                  = NULL;
 static int g_backend_ready = 0;
 static int g_using_delegate = 0;
 
-/* THEM MOI: ghi lai LY DO cu the neu roi ve CPU thuan, de khong con phai
- * doan qua log rai rac - in ra 1 banner CANH BAO ro rang o cuoi backend_init()
- * thay vi de nguoi dung tuong nham "chay duoc" = "chay tren HTP/QNN". */
+/* Preserve the exact fallback reason so the final startup banner cannot be
+ * mistaken for successful QNN/HTP delegation. */
 static const char *g_fallback_reason = NULL;
 
 /* standalone-tflite supplies these symbols from generated model_data.c.
@@ -229,7 +228,6 @@ int backend_init(void)
                 return -1;
             }
             use_delegate = 0;
-            /* THEM MOI: ghi ly do fallback thay vi chi log roi im lang tiep tuc. */
             g_fallback_reason = "delegate lib khong doc duoc (DL_QNN_DELEGATE_LIB sai duong dan?)";
         }
         if (!readable_file_exists(backend_lib)) {
@@ -261,15 +259,12 @@ int backend_init(void)
             if (strict_delegate) {
                 return -1;
             }
-            /* THEM MOI */
             g_fallback_reason = "TfLiteExternalDelegateCreate() tra ve NULL - kiem tra lai "
                                  "backend_type/library_path/skel_library_dir co dung SDK/target khong";
         }
     } else if (delegate_disabled_by_env) {
         fprintf(stderr, "backend_tflite_delegate: QNN delegate disabled by DL_DISABLE_QNN_DELEGATE\n");
-        /* THEM MOI: day la fallback CO CHU DICH (nguoi dung tu tat), khac voi
-         * cac truong hop fail o tren - van ghi nhan de banner cuoi khong bi
-         * hieu nham la "loi", ma la "chu dong chay CPU". */
+        /* This is an intentional CPU selection, not a delegate failure. */
         g_fallback_reason = "DL_DISABLE_QNN_DELEGATE dang bat (chu dong tat delegate, khong phai loi)";
     }
 
@@ -315,12 +310,8 @@ int backend_init(void)
             TfLiteTensorByteSize(in_tensor),
             TfLiteTensorByteSize(out_tensor));
 
-    /* THEM MOI: banner canh bao KHONG THE BO QUA khi thuc te dang chay CPU
-     * thuan, du ban dau co the da yeu cau delegate. Truoc day thong tin nay
-     * chi nam lan trong 1 dong log "ready mode=..." - de bi luot qua khi
-     * doc terminal dai. Muon tat banner nay (vi da CHU DONG chon CPU) thi
-     * dat DL_DISABLE_QNN_DELEGATE=1, luc do g_fallback_reason se noi ro la
-     * "chu dong", khong in banner ***. */
+    /* Make an unexpected CPU fallback prominent. Intentional CPU mode is
+     * already identified by DL_DISABLE_QNN_DELEGATE and needs no warning. */
     if (!g_using_delegate && g_fallback_reason != NULL && !delegate_disabled_by_env) {
         fprintf(stderr,
                 "backend_tflite_delegate: *** CANH BAO: DANG CHAY TFLITE CPU THUAN, "
@@ -336,10 +327,6 @@ int backend_init(void)
 #endif
 }
 
-/* THEM MOI: doc dtype that cua tensor (kTfLiteUInt8/kTfLiteInt8/kTfLiteFloat32)
- * qua TfLiteTensorType(), va tham so quantization qua
- * TfLiteTensorQuantizationParams() - ca hai deu la TFLite C API co san,
- * khong can sua gi ben ngoai file nay. */
 static dl_tensor_dtype_t map_tflite_type(TfLiteType t)
 {
     switch (t) {
@@ -365,19 +352,14 @@ int backend_get_io_count(int *input_count, int *output_count)
         return -1;
     }
 
-    /* Gia dinh model 1 input / 1 output, giong quy uoc cua backend_qnn_api.c.
-     * Neu model TFLite thuc te co nhieu input/output tensor, can mo rong
-     * interface backend.h de tra ve mang thay vi 1 gia tri. */
+    /* This compatibility function is intentionally limited to the primary
+     * input/output. Multi-tensor applications use the instance API. */
     const TfLiteTensor *in_tensor = TfLiteInterpreterGetInputTensor(g_interpreter, 0);
     const TfLiteTensor *out_tensor = TfLiteInterpreterGetOutputTensor(g_interpreter, 0);
     if (in_tensor == NULL || out_tensor == NULL) {
         return -1;
     }
 
-    /* SUA: truoc day luon chia cho sizeof(float), sai voi model uint8/int8
-     * (1 byte/phan tu chu khong phai 4). Gio chia theo dung kich thuoc
-     * kieu du lieu that cua tensor. Voi model float32 (truong hop cu),
-     * ket qua giu nguyen y het truoc day. */
     TfLiteType in_type = TfLiteTensorType(in_tensor);
     TfLiteType out_type = TfLiteTensorType(out_tensor);
     if ((in_type != kTfLiteFloat32 && in_type != kTfLiteUInt8 && in_type != kTfLiteInt8) ||
@@ -422,15 +404,19 @@ int backend_get_tensor_info(int is_input, int index, dl_tensor_info_t *info)
     size_t count = 1;
     for (int i = 0; i < info->rank; ++i) {
         int dim = TfLiteTensorDim(tensor, i);
-        if (dim <= 0) return -1;
+        if (dim <= 0 || count > SIZE_MAX / (size_t)dim) return -1;
         info->dimensions[i] = (uint32_t)dim;
         count *= (size_t)dim;
     }
     info->element_count = count;
     info->byte_size = TfLiteTensorByteSize(tensor);
     TfLiteQuantizationParams quant = TfLiteTensorQuantizationParams(tensor);
-    info->scale = info->dtype == DL_DTYPE_FLOAT32 ? 1.0f : quant.scale;
-    info->zero_point = info->dtype == DL_DTYPE_FLOAT32 ? 0 : quant.zero_point;
+    const int is_quantized = info->dtype == DL_DTYPE_UINT8 ||
+                             info->dtype == DL_DTYPE_INT8 ||
+                             info->dtype == DL_DTYPE_UINT16 ||
+                             info->dtype == DL_DTYPE_INT16;
+    info->scale = is_quantized ? quant.scale : 1.0f;
+    info->zero_point = is_quantized ? quant.zero_point : 0;
     info->quantized_axis = -1;
     return 0;
 }
@@ -514,17 +500,20 @@ int backend_execute(const float *input, int input_count, float *output, int outp
     return 0;
 }
 
-/* THEM MOI: giong het backend_execute() ve luong xu ly (copy input ->
- * Invoke -> copy output), chi khac la lam viec voi byte tho theo dung
- * dtype that cua tensor thay vi ep ve float. input_count/output_count la
- * SO PHAN TU - ham nay tu doi ra so byte dung theo TfLiteTensorByteSize()
- * cua tensor that, khong tu gia dinh 1 hay 4 byte/phan tu. */
 int backend_execute_raw(const void *input, int input_count, void *output, int output_count)
 {
-    (void)input_count;
-    (void)output_count;
-
     if (!g_backend_ready || input == NULL || output == NULL) {
+        return -1;
+    }
+
+    dl_tensor_info_t input_info;
+    dl_tensor_info_t output_info;
+    if (backend_get_tensor_info(1, 0, &input_info) != 0 ||
+        backend_get_tensor_info(0, 0, &output_info) != 0 ||
+        input_count < 0 || output_count < 0 ||
+        input_info.element_count != (size_t)input_count ||
+        output_info.element_count != (size_t)output_count) {
+        fprintf(stderr, "backend_tflite_delegate: raw tensor element count mismatch\n");
         return -1;
     }
 

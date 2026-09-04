@@ -6,9 +6,11 @@ venv/
 
 # Build artifacts
 **/build/
+/dist/
 *.o
 *.a
 *.so
+*.log
 
 # Python cache
 **/__pycache__/
@@ -28,3 +30,6 @@ venv/
 *.dlc
 *.raw
 *.npy
+
+# Generated source/context bundles
+ai_runtime_prototype/context_package/
