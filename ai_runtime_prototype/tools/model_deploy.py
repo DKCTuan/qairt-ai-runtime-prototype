@@ -1215,6 +1215,11 @@ def command_static_library(args):
         if output.exists():
             output.unlink()
         shutil.copy2(built, output)
+        # Bazel marks generated binaries read-only.  Preserve the useful
+        # executable bits but make the copied artifact owner-writable so a
+        # normal deployment step can run `strip --strip-unneeded OUTPUT`
+        # without requiring a separate chmod workaround.
+        output.chmod(output.stat().st_mode | 0o200)
         if not args.shared:
             tflite_archive = (tensorflow_root / 'bazel-bin' / 'tensorflow' / 'lite' /
                               'libtflite_with_xnnpack_optional.a')
