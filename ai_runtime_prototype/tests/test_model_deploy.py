@@ -17,6 +17,18 @@ SPEC.loader.exec_module(model_deploy)
 
 
 class ModelDeployTests(unittest.TestCase):
+    def test_static_library_quantize_option_defaults_to_none(self):
+        parser = model_deploy.build_parser()
+        defaults = parser.parse_args([
+            'static-library', '--model', 'model.tflite', '--output', 'libai_model.so',
+        ])
+        int8 = parser.parse_args([
+            'static-library', '--model', 'model.tflite', '--output', 'libai_model.so',
+            '--quantize', 'int8',
+        ])
+        self.assertEqual(defaults.quantize, 'none')
+        self.assertEqual(int8.quantize, 'int8')
+
     def test_quantized_tensor_reader(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'output.raw'

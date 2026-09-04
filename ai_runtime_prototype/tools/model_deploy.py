@@ -1113,6 +1113,95 @@ def command_standalone_tflite(args):
             shutil.rmtree(package_dir, ignore_errors=True)
 
 
+def _quantize_tflite_weights(model: Path, tensorflow_root: Path, mode: str,
+                             bazel: str, log_path: Path):
+    """Create an INT8/FP16 weight-quantized TFLite model.
+
+    This post-training transformation operates on an existing .tflite file and
+    intentionally preserves its float input/output interface.  It is therefore
+    different from calibrated full-integer quantization, which requires the
+    original converter input and a representative dataset.
+    """
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()[:16]
+    package_name = f'model_deploy_quantize_{digest}_{mode}'
+    package_dir = tensorflow_root / package_name
+    if package_dir.exists():
+        shutil.rmtree(package_dir)
+    package_dir.mkdir()
+
+    quantized_model = package_dir / f'model_{mode}.tflite'
+    buffer_type = {
+        'int8': 'QUANTIZED_INT8',
+        'float16': 'QUANTIZED_FLOAT16',
+    }[mode]
+    source = f'''#include <fstream>
+#include "flatbuffers/flatbuffers.h"
+#include "tensorflow/lite/core/model.h"
+#include "tensorflow/lite/tools/optimize/quantize_weights.h"
+
+int main(int argc, char **argv) {{
+  if (argc != 3) return 2;
+  auto model = tflite::FlatBufferModel::BuildFromFile(argv[1]);
+  if (!model || model->GetModel() == nullptr) return 3;
+  flatbuffers::FlatBufferBuilder builder;
+  if (tflite::optimize::QuantizeWeights(
+          &builder, model->GetModel(),
+          tflite::optimize::BufferType::{buffer_type}) != kTfLiteOk) {{
+    return 4;
+  }}
+  std::ofstream out(argv[2], std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char *>(builder.GetBufferPointer()),
+            builder.GetSize());
+  return out.good() ? 0 : 5;
+}}
+'''
+    (package_dir / 'quantize_tflite.cc').write_text(source, encoding='utf-8')
+    (package_dir / 'BUILD').write_text(
+        '# Use TensorFlow Lite\'s portable weight quantizer directly. Depending\n'
+        '# on the generic quantize_weights target would also build the MLIR\n'
+        '# quantizer and a large host-only dependency graph.\n'
+        'cc_library(\n'
+        '    name = "portable_weight_quantizer",\n'
+        '    srcs = ["//tensorflow/lite/tools/optimize:quantize_weights_portable.cc"],\n'
+        '    hdrs = ["//tensorflow/lite/tools/optimize:quantize_weights.h"],\n'
+        '    deps = [\n'
+        '        "//tensorflow/lite/tools/optimize:quantization_utils",\n'
+        '        "//tensorflow/lite/tools/optimize:model_utils",\n'
+        '        "@com_google_absl//absl/memory",\n'
+        '        "@com_google_absl//absl/strings",\n'
+        '        "@com_google_absl//absl/container:flat_hash_map",\n'
+        '        "@com_google_absl//absl/container:flat_hash_set",\n'
+        '        "@flatbuffers",\n'
+        '        "//tensorflow/lite:framework",\n'
+        '        "//tensorflow/lite/core:framework",\n'
+        '        "//tensorflow/lite/kernels/internal:tensor_utils",\n'
+        '        "//tensorflow/lite/schema:schema_fbs",\n'
+        '        "//tensorflow/lite/schema:schema_utils",\n'
+        '        "//tensorflow/core:tflite_portable_logging",\n'
+        '    ],\n'
+        ')\n\n'
+        'cc_binary(\n'
+        '    name = "quantize_tflite",\n'
+        '    srcs = ["quantize_tflite.cc"],\n'
+        '    deps = [\n'
+        '        "//tensorflow/lite/core:model_builder",\n'
+        '        ":portable_weight_quantizer",\n'
+        '        "@flatbuffers",\n'
+        '    ],\n'
+        ')\n', encoding='utf-8')
+
+    target = f'//{package_name}:quantize_tflite'
+    run([bazel, 'build', '-c', 'opt', target], cwd=tensorflow_root,
+        log_path=log_path)
+    executable = tensorflow_root / 'bazel-bin' / package_name / 'quantize_tflite'
+    ensure_file(executable, 'TFLite weight quantizer')
+    run([str(executable), str(model), str(quantized_model)],
+        cwd=tensorflow_root,
+        log_path=log_path.with_name(f'{log_path.stem}.run{log_path.suffix}'))
+    ensure_file(quantized_model, f'{mode} weight-quantized TFLite model')
+    return quantized_model, package_dir
+
+
 def command_static_library(args):
     """Build a reusable static archive containing one embedded TFLite model.
 
@@ -1132,7 +1221,16 @@ def command_static_library(args):
         fail(f'output already exists: {output} (use --force to replace it)')
 
     tflite_project = Path(__file__).resolve().parents[2] / 'tflite_qnn_prototype'
-    digest = hashlib.sha256(model.read_bytes()).hexdigest()[:16]
+    bazel = args.bazel or str(Path.home() / 'bin' / 'bazelisk')
+    quantize_mode = getattr(args, 'quantize', 'none')
+    effective_model = model
+    quantize_dir = None
+    if quantize_mode != 'none':
+        effective_model, quantize_dir = _quantize_tflite_weights(
+            model, tensorflow_root, quantize_mode, bazel,
+            output.parent / f'{output.name}.quantize.log')
+
+    digest = hashlib.sha256(effective_model.read_bytes()).hexdigest()[:16]
     package_name = f'model_deploy_library_{digest}'
     package_dir = tensorflow_root / package_name
     if package_dir.exists():
@@ -1149,14 +1247,25 @@ def command_static_library(args):
         ):
             ensure_file(source, 'static library source')
             shutil.copy2(source, package_dir / destination)
-        _write_embedded_model_c(model, package_dir / 'model_data.c')
+        # Keep the flatbuffer as a Bazel data input for TensorFlow Lite's
+        # model-selective operator registration, and also embed the same bytes
+        # in model_data.c for deployment.
+        shutil.copy2(effective_model, package_dir / 'embedded_model.tflite')
+        _write_embedded_model_c(effective_model, package_dir / 'model_data.c')
         if args.shared:
             build_rule = (
+                'load("//tensorflow/lite:build_def.bzl", "tflite_custom_c_library")\n\n'
+                '# Generate a C API runtime containing only operators used by\n'
+                '# embedded_model.tflite.\n'
+                'tflite_custom_c_library(\n'
+                '    name = "model_c_api",\n'
+                '    models = ["embedded_model.tflite"],\n'
+                ')\n\n'
                 'cc_binary(\n'
                 '    name = "ai_model",\n'
                 '    srcs = ["ai_model.c", "ai_runtime.c", "backend_tflite_delegate.c", "model_data.c", "ai_model.h", "ai_runtime.h", "backend.h"],\n'
-                '    deps = ["//tensorflow/lite/c:c_api"],\n'
-                '    copts = ["-I.", "-DDL_TFLITE_STATIC_CPU"],\n'
+                '    deps = [":model_c_api"],\n'
+                '    copts = ["-I.", "-DDL_TFLITE_STATIC_CPU", "-Os", "-ffunction-sections", "-fdata-sections"],\n'
                 '    # TFLite is implemented in C++; embed its C++/GCC runtime so\n'
                 '    # the deployed .so works on minimal ARM64 firmware images.\n'
                 '    # The embedded ARM toolchain adds -lstdc++ after ordinary\n'
@@ -1167,7 +1276,10 @@ def command_static_library(args):
                 '        "-static-libstdc++", "-static-libgcc",\n'
                 '        "-Wl,--push-state,-Bstatic", "-lstdc++",\n'
                 '        "-Wl,--pop-state",\n'
+                '        "-Wl,--gc-sections",\n'
+                '        "-Wl,--version-script,$(location :exports.lds)",\n'
                 '    ],\n'
+                '    additional_linker_inputs = ["exports.lds"],\n'
                 '    linkshared = True,\n'
                 ')\n')
         else:
@@ -1181,7 +1293,18 @@ def command_static_library(args):
                 '    linkstatic = True,\n'
                 ')\n')
         (package_dir / 'BUILD').write_text(build_rule, encoding='utf-8')
-        bazel = args.bazel or str(Path.home() / 'bin' / 'bazelisk')
+        if args.shared:
+            # The application-facing wrapper is the only public ABI. Hiding
+            # TFLite/C++ implementation symbols cuts the dynamic symbol table
+            # and prevents applications from depending on backend internals.
+            (package_dir / 'exports.lds').write_text(
+                '{\n'
+                '  global:\n'
+                '    ai_model_init;\n'
+                '    ai_model_predict;\n'
+                '    ai_model_deinit;\n'
+                '  local: *;\n'
+                '};\n', encoding='utf-8')
         command = [bazel, 'build', '-c', 'opt']
         if args.aarch64_toolchain:
             toolchain = Path(args.aarch64_toolchain).expanduser().resolve()
@@ -1206,7 +1329,13 @@ def command_static_library(args):
             command.extend(['--define', 'framework_shared_object=false'])
         if args.target_config:
             command.append(f'--config={args.target_config}')
-        command.extend([f'//{package_name}:ai_model', '//tensorflow/lite:tflite_with_xnnpack_optional'])
+        command.extend([
+            '--copt=-Os',
+            '--copt=-ffunction-sections',
+            '--copt=-fdata-sections',
+            '--linkopt=-Wl,--gc-sections',
+            f'//{package_name}:ai_model',
+        ])
         run(command, cwd=tensorflow_root, log_path=output.parent / f'{output.name}.build.log')
         built_name = 'libai_model.so' if args.shared else 'libai_model.a'
         built = tensorflow_root / 'bazel-bin' / package_name / built_name
@@ -1232,6 +1361,9 @@ def command_static_library(args):
             'mode': 'tflite_cpu_shared_library' if args.shared else 'tflite_cpu_static_library',
             'library': str(output),
             'headers': [str(output.parent / 'ai_model.h'), str(output.parent / 'ai_runtime.h')],
+            'runtime': 'model-selective' if args.shared else 'full-static-archive',
+            'quantize': quantize_mode,
+            'embedded_model_bytes': effective_model.stat().st_size,
             'note': ('Model bytes and TFLite runtime are embedded in the shared library; '
                      'link the application with -lai_model.' if args.shared else
                      'Static archive requires a separately linkable TFLite C API archive.'),
@@ -1239,6 +1371,8 @@ def command_static_library(args):
     finally:
         if not args.keep_build_dir:
             shutil.rmtree(package_dir, ignore_errors=True)
+            if quantize_dir is not None:
+                shutil.rmtree(quantize_dir, ignore_errors=True)
 
 
 def build_parser():
@@ -1297,6 +1431,10 @@ def build_parser():
                         'the selected ARM64 compiler version')
     p.add_argument('--shared', action='store_true',
                    help='Build libai_model.so containing the model and TFLite runtime')
+    p.add_argument('--quantize', choices=['none', 'int8', 'float16'], default='none',
+                   help='Optionally quantize model weights before embedding. '
+                        'The int8/float16 modes preserve float model I/O and are '
+                        'not calibrated full-integer quantization (default: none).')
     p.add_argument('--force', action='store_true')
     p.add_argument('--keep-build-dir', action='store_true')
     p.set_defaults(func=command_static_library)
