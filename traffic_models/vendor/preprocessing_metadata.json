@@ -1,0 +1,33 @@
+{
+  "input_shape": [
+    1,
+    90,
+    3
+  ],
+  "input_dtype": "float32",
+  "feature_names": [
+    "delta_time",
+    "direction",
+    "packet_length"
+  ],
+  "continuous_feature_indices": [
+    0,
+    2
+  ],
+  "continuous_mean": [
+    0.005491858348250389,
+    626.3450317382812
+  ],
+  "continuous_std": [
+    0.07258545607328415,
+    594.463134765625
+  ],
+  "normalization_formula": "(x - mean) / std",
+  "class_names": [
+    "Background",
+    "Game",
+    "RTVideo",
+    "VStream",
+    "Voice"
+  ]
+}
