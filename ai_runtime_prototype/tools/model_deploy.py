@@ -1082,7 +1082,13 @@ def command_standalone_tflite(args):
             '    linkopts = ["-static", "-s", "-lm"],\n'
             ')\n', encoding='utf-8')
         bazel = args.bazel or str(Path.home() / 'bin' / 'bazelisk')
-        command = [bazel, 'build', '-c', 'opt']
+        command = [bazel]
+        # Some WSL/CI environments cannot keep Bazel's gRPC server alive.
+        # Batch mode is slower but uses no persistent server and is therefore
+        # a reliable option for a reproducible deployment build.
+        if getattr(args, 'bazel_batch', False):
+            command.append('--batch')
+        command.extend(['build', '-c', 'opt'])
         if args.target_config:
             command.append(f'--config={args.target_config}')
         command.append(f'//{package_name}:runner')
@@ -1202,6 +1208,108 @@ int main(int argc, char **argv) {{
     return quantized_model, package_dir
 
 
+def _generated_tflite_path(output: Path) -> Path:
+    """Choose the inspectable TFLite artifact beside a packaged library."""
+    return output.with_suffix('.source.tflite')
+
+
+def _convert_onnx_to_tflite(args, model: Path, destination: Path) -> Path:
+    """Best-effort ONNX -> TFLite conversion through the isolated ONNX venv.
+
+    ONNX is intentionally not treated as a guarantee: unsupported operations
+    or dynamic graph constructs need a re-export from the model owner.  The
+    complete converter log is retained beside the generated TFLite model.
+    """
+    converter = Path(args.onnx2tf).expanduser().resolve()
+    ensure_file(converter, 'onnx2tf executable')
+    work_dir = destination.with_suffix('.onnx2tf-work')
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    command = [str(converter), '-i', str(model), '-o', str(work_dir), '-nuo', '--non_verbose']
+    if args.onnx_input_shape:
+        command.extend(['-ois', *args.onnx_input_shape])
+    run(command, env={**os.environ, 'CUDA_VISIBLE_DEVICES': ''},
+        log_path=destination.with_suffix('.onnx2tf.log'))
+
+    candidates = sorted(work_dir.rglob('*.tflite'))
+    if not candidates:
+        fail('onnx2tf finished without producing a .tflite file; see log: '
+             f'{destination.with_suffix(".onnx2tf.log")}')
+    float32 = [path for path in candidates if 'float32' in path.name.lower()]
+    selected = float32[0] if len(float32) == 1 else candidates[0]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(selected, destination)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    return destination
+
+
+def _convert_pytorch_to_tflite(args, model: Path, destination: Path) -> Path:
+    """Invoke the separate PyTorch/LiteRT environment without importing it here."""
+    # Do not resolve this path: a venv's ``bin/python`` commonly is a symlink
+    # to the system interpreter.  Resolving it would discard pyvenv.cfg and
+    # execute outside the isolated model-torch environment.
+    python = Path(args.torch_python).expanduser()
+    ensure_file(python, 'model-torch Python executable')
+    exporter = Path(__file__).resolve().with_name('pytorch_to_tflite.py')
+    ensure_file(exporter, 'PyTorch TFLite exporter')
+    command = [str(python), str(exporter), '--model', str(model), '--output', str(destination)]
+    if args.input_shape:
+        command.extend(['--input-shape', args.input_shape])
+    if args.metadata:
+        command.extend(['--metadata', args.metadata])
+    if args.reference_input:
+        command.extend(['--reference-input', args.reference_input])
+    if args.model_loader:
+        command.extend(['--model-loader', args.model_loader])
+    if args.trust_pytorch_pickle:
+        command.append('--trust-pytorch-pickle')
+    run(command, env={**os.environ, 'CUDA_VISIBLE_DEVICES': ''},
+        log_path=destination.with_suffix('.pytorch-export.log'))
+    ensure_file(destination, 'exported TFLite model')
+    return destination
+
+
+def command_package_deep_learning(args):
+    """Turn TFLite, ONNX, or supported PyTorch input into an ARM64 model .so."""
+    source = Path(args.model).expanduser().resolve()
+    ensure_file(source, 'source model')
+    suffix = source.suffix.lower()
+    output = Path(args.output).expanduser().resolve()
+    if suffix not in ('.tflite', '.onnx', '.pt', '.pth'):
+        fail('package-deep-learning accepts .tflite, .onnx, .pt, or .pth')
+    if output.suffix.lower() != '.so':
+        fail('package-deep-learning always creates a shared library; --output must end in .so')
+
+    if suffix == '.tflite':
+        tflite = source
+        conversion = 'none'
+    else:
+        tflite = _generated_tflite_path(output)
+        if tflite.exists() and not args.force:
+            fail(f'generated TFLite already exists: {tflite} (use --force to replace it)')
+        if suffix == '.onnx':
+            tflite = _convert_onnx_to_tflite(args, source, tflite)
+            conversion = 'onnx2tf'
+        else:
+            tflite = _convert_pytorch_to_tflite(args, source, tflite)
+            conversion = 'pytorch-litert'
+
+    original_model = args.model
+    args.model = str(tflite)
+    try:
+        command_static_library(args)
+    finally:
+        args.model = original_model
+    print(json.dumps({
+        'status': 'success',
+        'source_model': str(source),
+        'source_format': suffix.removeprefix('.'),
+        'conversion': conversion,
+        'tflite_model': str(tflite),
+        'library': str(output),
+    }, indent=2))
+
+
 def command_static_library(args):
     """Build a reusable static archive containing one embedded TFLite model.
 
@@ -1305,7 +1413,10 @@ def command_static_library(args):
                 '    ai_model_deinit;\n'
                 '  local: *;\n'
                 '};\n', encoding='utf-8')
-        command = [bazel, 'build', '-c', 'opt']
+        command = [bazel]
+        if getattr(args, 'bazel_batch', False):
+            command.append('--batch')
+        command.extend(['build', '-c', 'opt'])
         if args.aarch64_toolchain:
             toolchain = Path(args.aarch64_toolchain).expanduser().resolve()
             ensure_file(toolchain / 'bin' / 'aarch64-none-linux-gnu-gcc',
@@ -1422,6 +1533,8 @@ def build_parser():
     p.add_argument('--output', required=True, help='Output archive, for example dist/libai_model.a')
     p.add_argument('--tensorflow-root', default=str(Path.home() / 'tensorflow'))
     p.add_argument('--bazel', default=None)
+    p.add_argument('--bazel-batch', action='store_true',
+                   help='Run Bazel without its persistent server (slower, useful on WSL/CI)')
     p.add_argument('--target-config', default='elinux_aarch64')
     p.add_argument('--aarch64-toolchain', default=None,
                    help='Bazel repository containing an ARM64 GNU toolchain; '
@@ -1438,6 +1551,43 @@ def build_parser():
     p.add_argument('--force', action='store_true')
     p.add_argument('--keep-build-dir', action='store_true')
     p.set_defaults(func=command_static_library)
+
+    p = sub.add_parser('package-deep-learning',
+                       help='Convert .tflite/.onnx/.pt/.pth when needed, then build an ARM64 model .so')
+    p.add_argument('--model', required=True,
+                   help='Source .tflite, .onnx, .pt, or .pth model')
+    p.add_argument('--output', required=True,
+                   help='Output shared library, for example dist/libai_model.so')
+    p.add_argument('--tensorflow-root', default=str(Path.home() / 'tensorflow'))
+    p.add_argument('--bazel', default=None)
+    p.add_argument('--bazel-batch', action='store_true',
+                   help='Run Bazel without its persistent server (slower, useful on WSL/CI)')
+    p.add_argument('--target-config', default='elinux_aarch64')
+    p.add_argument('--aarch64-toolchain', default=None)
+    p.add_argument('--aarch64-toolchain-config', default=None)
+    p.add_argument('--quantize', choices=['none', 'int8', 'float16'], default='none')
+    p.add_argument('--force', action='store_true')
+    p.add_argument('--keep-build-dir', action='store_true')
+    p.add_argument('--torch-python', default=str(Path.home() / 'venvs/model-torch/bin/python'),
+                   help='Python executable in the isolated PyTorch/LiteRT environment')
+    p.add_argument('--trust-pytorch-pickle', action='store_true',
+                   help='Permit loading a trusted non-TorchScript .pt/.pth checkpoint')
+    p.add_argument('--metadata',
+                   help='Optional preprocessing metadata JSON for PyTorch models')
+    p.add_argument('--input-shape',
+                   help='Override model input shape, for example 1,90,3')
+    p.add_argument('--reference-input',
+                   help='Optional .npy input for PyTorch/TFLite parity validation')
+    p.add_argument('--model-loader',
+                   help='Trusted Python loader for a PyTorch state_dict checkpoint')
+    p.add_argument('--onnx2tf', default=str(Path.home() / 'venvs/model-onnx/bin/onnx2tf'),
+                   help='onnx2tf executable in the isolated ONNX environment')
+    p.add_argument('--onnx-input-shape', action='append',
+                   help='Static ONNX input override, for example input_seq:1,80,3; repeat for multiple inputs')
+    # This command deliberately has one deployment artifact: a shared model
+    # library.  Do not expose --shared here, because turning it off would make
+    # the command's --output .so contract false.
+    p.set_defaults(func=command_package_deep_learning, shared=True)
 
     p = sub.add_parser('convert', help='Convert MODEL to .dlc; output defaults next to MODEL')
     p.add_argument('model_positional', nargs='?', metavar='MODEL')
