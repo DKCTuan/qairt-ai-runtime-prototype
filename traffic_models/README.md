@@ -31,16 +31,14 @@ không yêu cầu khởi tạo runtime.
 - RF latency đo suy luận, không gồm feature extraction. API kiểm tra số phần tử
   và giá trị hữu hạn. Các lời gọi tuần tự, chưa hỗ trợ GRU đa luồng.
 
-## GRU chờ model
+## GRU đã có model TFLite
 
-Mặc định chỉ RF; traffic_gru_init/predict trả -2 khi chưa có GRU.
-Không fallback về model cũ. Khi nhận TFLite cần kiểm tra shape/layout, dtype,
-logits/probabilities và output chuẩn trước khi bật.
-Tool model_deploy.py static-library --shared có thể đóng gói thành libtiny_gru.so.
-Makefile có GRU_LIBRARY và GRU_INCLUDE để liên kết AI Model API đó; dùng OUT mới
-khi bật GRU. Khi đó triển khai thêm libtiny_gru.so cạnh app và libtraffic_models.so.
-Gọi traffic_gru_init một lần, predict mỗi mẫu và deinit khi kết thúc.
-Nhánh GRU chưa được kiểm chứng với model mới.
+Đã kiểm tra tiny_gru_float32.tflite: input [1,90,3] float32, output [1,5]
+float32. Output là scores/logits, không phải xác suất. Xem [DUAL_MODELS.md](DUAL_MODELS.md)
+để build và nạp cùng RF. Artifact dual ở dist/dual_models; app chọn rf/gru/both.
+Mặc định Makefile vẫn build RF-only nếu không truyền GRU_LIBRARY; khi đó API
+GRU trả -2. Không fallback về model cũ. Gọi init một lần, predict mỗi mẫu,
+deinit khi kết thúc. Đã chạy model mới bằng QEMU; chờ kiểm thử iGate.
 
 ## Nguồn và kiểm thử
 

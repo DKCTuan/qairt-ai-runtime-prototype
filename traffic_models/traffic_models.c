@@ -65,7 +65,11 @@ int traffic_gru_predict(const float *input, size_t count, traffic_result *result
     size_t outputs = 0;
     if (ai_model_predict(input, count, result->scores, TRAFFIC_CLASSES,
                          &outputs, &result->label, &result->latency_ms) ||
-        outputs != TRAFFIC_CLASSES) return TRAFFIC_INFERENCE_ERROR;
+        outputs != TRAFFIC_CLASSES || result->label < 0 ||
+        result->label >= TRAFFIC_CLASSES || !valid(result->scores, outputs, TRAFFIC_CLASSES)) {
+        memset(result, 0, sizeof(*result)); result->label = -1;
+        return TRAFFIC_INFERENCE_ERROR;
+    }
     return TRAFFIC_OK;
 #else
     return TRAFFIC_MODEL_UNAVAILABLE;
