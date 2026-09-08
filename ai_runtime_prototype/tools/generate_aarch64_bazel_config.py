@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -44,7 +45,11 @@ def compiler_target(compiler: Path) -> str:
     return target
 
 
-def write_build(destination: Path) -> None:
+def write_build(destination: Path, *, include_compiler_wrapper: bool) -> None:
+    wrapper_target = (
+        'filegroup(name = "compiler_wrapper", srcs = ["compiler_wrapper.sh"])\n\n'
+        if include_compiler_wrapper else '')
+    wrapper_src = '":compiler_wrapper", ' if include_compiler_wrapper else ''
     destination.write_text(
         'load(":cc_config.bzl", "cc_toolchain_config")\n\n'
         'package(default_visibility = ["//visibility:public"])\n\n'
@@ -53,9 +58,10 @@ def write_build(destination: Path) -> None:
         '    toolchains = {"aarch64": ":cc-compiler-aarch64"},\n'
         ')\n\n'
         'filegroup(name = "empty", srcs = [])\n\n'
+        + wrapper_target +
         'filegroup(\n'
         '    name = "aarch64_toolchain_all_files",\n'
-        '    srcs = ["@aarch64_linux_toolchain//:compiler_pieces"],\n'
+        f'    srcs = [{wrapper_src}"@aarch64_linux_toolchain//:compiler_pieces"],\n'
         ')\n\n'
         'cc_toolchain_config(name = "aarch64_toolchain_config", cpu = "aarch64")\n\n'
         'cc_toolchain(\n'
@@ -175,8 +181,10 @@ def main() -> None:
     # include and tool paths.  Replace them instead of asking a vendor SDK to
     # expose misleading aarch64-none-linux-gnu compatibility symlinks.
     config = config.replace("aarch64-none-linux-gnu", target)
-    config = re.sub(rf"{re.escape(target)}/\\d+\\.\\d+\\.\\d+",
+    config = re.sub(rf"{re.escape(target)}/\d+\.\d+\.\d+",
                     f"{target}/{version}", config)
+    config = re.sub(rf"{re.escape(target)}/include/c\+\+/\d+\.\d+\.\d+",
+                    f"{target}/include/c++/{version}", config)
     if args.target_libc == "musl":
         # TensorFlow's stock embedded template unconditionally adds the host
         # /usr/include.  That mixes host glibc headers with OpenWrt musl
@@ -228,8 +236,22 @@ def main() -> None:
         config = config.replace(
             f"{toolchain}/{target}/libc/usr/include/",
             f"{sysroot}/usr/include/")
+    compiler_wrapper = None
+    if args.target_libc == "musl":
+        compiler_wrapper = output / "compiler_wrapper.sh"
+        compiler_wrapper.write_text(
+            "#!/bin/sh\n"
+            f"export STAGING_DIR={shlex.quote(str(staging_dir))}\n"
+            f"exec {shlex.quote(str(compiler))} \"$@\"\n",
+            encoding="utf-8")
+        compiler_wrapper.chmod(0o755)
+        real_compiler_path = f'{toolchain}/bin/{target}-gcc'
+        if real_compiler_path not in config:
+            fail("cannot locate ARM64 GCC tool path in generated configuration")
+        config = config.replace(real_compiler_path, str(compiler_wrapper))
     (output / "cc_config.bzl").write_text(config, encoding="utf-8")
-    write_build(output / "BUILD.bazel")
+    write_build(output / "BUILD.bazel",
+                include_compiler_wrapper=compiler_wrapper is not None)
     (output / "WORKSPACE").write_text(
         'workspace(name = "local_config_embedded_arm")\n', encoding="utf-8")
 
