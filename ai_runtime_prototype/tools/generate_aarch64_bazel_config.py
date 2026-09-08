@@ -11,6 +11,7 @@ OpenWrt's ``aarch64-openwrt-linux-musl-gcc``.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -121,6 +122,8 @@ def main() -> None:
     parser.add_argument("--target-libc", choices=["glibc", "musl"], default="glibc",
                         help="target C library ABI; musl removes host glibc "
                              "headers from TensorFlow's embedded template")
+    parser.add_argument("--sysroot", default=None,
+                        help="target sysroot; required for musl targets")
     parser.add_argument("--output", required=True,
                         help="new local_config_embedded_arm repository directory")
     parser.add_argument("--toolchain-repository-output", default=None,
@@ -133,6 +136,7 @@ def main() -> None:
     tensorflow = Path(args.tensorflow_root).expanduser().resolve()
     toolchain = Path(args.toolchain).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
+    sysroot = Path(args.sysroot).expanduser().resolve() if args.sysroot else None
     template = tensorflow / "tensorflow/tools/toolchains/embedded/arm-linux/cc_config.bzl.tpl"
     build_template = tensorflow / "tensorflow/tools/toolchains/embedded/arm-linux/aarch64-linux-toolchain.BUILD"
     compiler = (Path(args.compiler).expanduser().resolve()
@@ -141,6 +145,10 @@ def main() -> None:
         fail("TensorFlow embedded ARM toolchain templates were not found; use TensorFlow v2.15 source")
     if not compiler.is_file():
         fail(f"ARM64 compiler not found: {compiler}")
+    if args.target_libc == "musl" and not sysroot:
+        fail("--sysroot is required when --target-libc musl")
+    if sysroot and not sysroot.is_dir():
+        fail(f"sysroot directory not found: {sysroot}")
     if output.exists():
         if not args.force:
             fail(f"output already exists: {output} (use --force to replace it)")
@@ -155,6 +163,12 @@ def main() -> None:
     # ARMHF is deliberately absent from the generated BUILD.  Leave its
     # inactive branch syntactically valid without pretending ARMHF is tested.
     config = config.replace("%{ARMHF_COMPILER_PATH}%", "/opt/armhf-toolchain-not-configured")
+    # TensorFlow v2.15 embeds both the GNU target name and GCC 11.3.1 in its
+    # include and tool paths.  Replace them instead of asking a vendor SDK to
+    # expose misleading aarch64-none-linux-gnu compatibility symlinks.
+    config = config.replace("aarch64-none-linux-gnu", target)
+    config = re.sub(rf"{re.escape(target)}/\\d+\\.\\d+\\.\\d+",
+                    f"{target}/{version}", config)
     if args.target_libc == "musl":
         # TensorFlow's stock embedded template unconditionally adds the host
         # /usr/include.  That mixes host glibc headers with OpenWrt musl
@@ -164,12 +178,19 @@ def main() -> None:
         config = config.replace(
             '                                "-isystem",\n'
             '                                "/usr/include/",\n', '')
-    # TensorFlow v2.15 embeds both the GNU target name and GCC 11.3.1 in its
-    # include and tool paths.  Replace them instead of asking a vendor SDK to
-    # expose misleading aarch64-none-linux-gnu compatibility symlinks.
-    config = config.replace("aarch64-none-linux-gnu", target)
-    config = re.sub(rf"{re.escape(target)}/\\d+\\.\\d+\\.\\d+",
-                    f"{target}/{version}", config)
+        config = config.replace(
+            '                                "-isystem",\n'
+            f'                                "{sysconfig_include()}",\n', '')
+        # The same host path is also registered as a builtin include
+        # directory later in the template, outside compile flags.
+        config = config.replace('                "/usr/include",\n', '')
+        config = config.replace(f'                "{sysconfig_include()}",\n', '')
+    if sysroot:
+        config = config.replace("builtin_sysroot = None",
+                                f"builtin_sysroot = {json.dumps(str(sysroot))}")
+        config = config.replace(
+            f"{toolchain}/{target}/libc/usr/include/",
+            f"{sysroot}/usr/include/")
     (output / "cc_config.bzl").write_text(config, encoding="utf-8")
     write_build(output / "BUILD.bazel")
     (output / "WORKSPACE").write_text(
@@ -202,6 +223,8 @@ def main() -> None:
     print(f"toolchain={toolchain}")
     if toolchain_repository:
         print(f"toolchain_repository={toolchain_repository}")
+    if sysroot:
+        print(f"sysroot={sysroot}")
 
 
 def sysconfig_include() -> str:
