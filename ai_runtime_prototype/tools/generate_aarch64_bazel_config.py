@@ -70,6 +70,44 @@ def write_build(destination: Path) -> None:
         ')\n', encoding="utf-8")
 
 
+def write_toolchain_wrapper(destination: Path, toolchain: Path, target: str,
+                            *, force: bool) -> None:
+    """Create a Bazel repository that reads, but never edits, a vendor SDK."""
+    if destination.exists():
+        if not force:
+            fail(f"toolchain repository exists: {destination} (use --force to replace it)")
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    (destination / "sdk").symlink_to(toolchain, target_is_directory=True)
+    build = (
+        'package(default_visibility = ["//visibility:public"])\n\n'
+        'filegroup(name = "gcc", srcs = ["sdk/bin/{target}-gcc"])\n'
+        'filegroup(name = "ar", srcs = ["sdk/bin/{target}-ar"])\n'
+        'filegroup(name = "ld", srcs = ["sdk/bin/{target}-ld"])\n'
+        'filegroup(name = "nm", srcs = ["sdk/bin/{target}-nm"])\n'
+        'filegroup(name = "objcopy", srcs = ["sdk/bin/{target}-objcopy"])\n'
+        'filegroup(name = "objdump", srcs = ["sdk/bin/{target}-objdump"])\n'
+        'filegroup(name = "strip", srcs = ["sdk/bin/{target}-strip"])\n'
+        'filegroup(name = "as", srcs = ["sdk/bin/{target}-as"])\n\n'
+        'filegroup(\n'
+        '    name = "compiler_pieces",\n'
+        '    srcs = glob([\n'
+        '        "sdk/{target}/**",\n'
+        '        "sdk/libexec/**",\n'
+        '        "sdk/lib/gcc/{target}/**",\n'
+        '        "sdk/include/**",\n'
+        '    ]),\n'
+        ')\n\n'
+        'filegroup(\n'
+        '    name = "compiler_components",\n'
+        '    srcs = [":ar", ":as", ":gcc", ":ld", ":nm", ":objcopy", ":objdump", ":strip"],\n'
+        ')\n'
+    ).format(target=target)
+    (destination / "BUILD.bazel").write_text(build, encoding="utf-8")
+    (destination / "WORKSPACE").write_text(
+        'workspace(name = "aarch64_linux_toolchain")\n', encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tensorflow-root", required=True,
@@ -81,6 +119,9 @@ def main() -> None:
                              "bin/aarch64-none-linux-gnu-gcc")
     parser.add_argument("--output", required=True,
                         help="new local_config_embedded_arm repository directory")
+    parser.add_argument("--toolchain-repository-output", default=None,
+                        help="optional Bazel wrapper repository for an immutable "
+                             "vendor toolchain")
     parser.add_argument("--force", action="store_true",
                         help="replace an existing output directory")
     args = parser.parse_args()
@@ -121,16 +162,24 @@ def main() -> None:
     (output / "WORKSPACE").write_text(
         'workspace(name = "local_config_embedded_arm")\n', encoding="utf-8")
 
-    # The override repository needs a BUILD file too.  Create it only if the
-    # user has not already supplied one, so the helper is non-destructive.
-    toolchain_build = toolchain / "BUILD.bazel"
-    if not toolchain_build.exists() and not (toolchain / "BUILD").exists():
-        build = build_template.read_text(encoding="utf-8")
-        toolchain_build.write_text(
-            build.replace("aarch64-none-linux-gnu", target), encoding="utf-8")
-    workspace = toolchain / "WORKSPACE.bazel"
-    if not workspace.exists() and not (toolchain / "WORKSPACE").exists():
-        workspace.write_text('workspace(name = "aarch64_linux_toolchain")\n', encoding="utf-8")
+    # A vendor SDK may be shared or read-only.  In that case create a separate
+    # wrapper repository in the user's workspace instead of writing BUILD
+    # metadata into the SDK itself.
+    toolchain_repository = None
+    if args.toolchain_repository_output:
+        toolchain_repository = Path(args.toolchain_repository_output).expanduser().resolve()
+        write_toolchain_wrapper(toolchain_repository, toolchain, target, force=args.force)
+    else:
+        # Backward-compatible mode for a developer-owned ARM GNU toolchain.
+        # The separate wrapper mode above is preferred for vendor QSDKs.
+        toolchain_build = toolchain / "BUILD.bazel"
+        if not toolchain_build.exists() and not (toolchain / "BUILD").exists():
+            build = build_template.read_text(encoding="utf-8")
+            toolchain_build.write_text(
+                build.replace("aarch64-none-linux-gnu", target), encoding="utf-8")
+        workspace = toolchain / "WORKSPACE.bazel"
+        if not workspace.exists() and not (toolchain / "WORKSPACE").exists():
+            workspace.write_text('workspace(name = "aarch64_linux_toolchain")\n', encoding="utf-8")
 
     print("status=success")
     print(f"gcc_version={version}")
@@ -138,6 +187,8 @@ def main() -> None:
     print(f"compiler={compiler}")
     print(f"config={output}")
     print(f"toolchain={toolchain}")
+    if toolchain_repository:
+        print(f"toolchain_repository={toolchain_repository}")
 
 
 def sysconfig_include() -> str:
