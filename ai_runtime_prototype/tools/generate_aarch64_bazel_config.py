@@ -124,6 +124,9 @@ def main() -> None:
                              "headers from TensorFlow's embedded template")
     parser.add_argument("--sysroot", default=None,
                         help="target sysroot; required for musl targets")
+    parser.add_argument("--staging-dir", default=None,
+                        help="OpenWrt/QSDK staging_dir exported inside Bazel C/C++ actions; "
+                             "defaults to the parent of --toolchain for musl")
     parser.add_argument("--output", required=True,
                         help="new local_config_embedded_arm repository directory")
     parser.add_argument("--toolchain-repository-output", default=None,
@@ -137,6 +140,9 @@ def main() -> None:
     toolchain = Path(args.toolchain).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     sysroot = Path(args.sysroot).expanduser().resolve() if args.sysroot else None
+    staging_dir = (Path(args.staging_dir).expanduser().resolve()
+                   if args.staging_dir else
+                   (toolchain.parent if args.target_libc == "musl" else None))
     template = tensorflow / "tensorflow/tools/toolchains/embedded/arm-linux/cc_config.bzl.tpl"
     build_template = tensorflow / "tensorflow/tools/toolchains/embedded/arm-linux/aarch64-linux-toolchain.BUILD"
     compiler = (Path(args.compiler).expanduser().resolve()
@@ -149,6 +155,8 @@ def main() -> None:
         fail("--sysroot is required when --target-libc musl")
     if sysroot and not sysroot.is_dir():
         fail(f"sysroot directory not found: {sysroot}")
+    if staging_dir and not staging_dir.is_dir():
+        fail(f"staging directory not found: {staging_dir}")
     if output.exists():
         if not args.force:
             fail(f"output already exists: {output} (use --force to replace it)")
@@ -185,6 +193,35 @@ def main() -> None:
         # directory later in the template, outside compile flags.
         config = config.replace('                "/usr/include",\n', '')
         config = config.replace(f'                "{sysconfig_include()}",\n', '')
+        # OpenWrt compiler wrappers require STAGING_DIR. Bazel deliberately
+        # sanitizes action environments, so a caller-side shell export (and,
+        # with some exec transitions, even --action_env) is not sufficient.
+        # Attach the variable to the C/C++ toolchain itself so target and exec
+        # actions which select this toolchain receive it deterministically.
+        environment_feature = (
+            '    openwrt_staging_environment_feature = feature(\n'
+            '        name = "openwrt_staging_environment",\n'
+            '        enabled = True,\n'
+            '        env_sets = [\n'
+            '            env_set(\n'
+            '                actions = all_compile_actions + all_link_actions,\n'
+            '                env_entries = [\n'
+            f'                    env_entry(key = "STAGING_DIR", value = {json.dumps(str(staging_dir))}),\n'
+            '                ],\n'
+            '            ),\n'
+            '        ],\n'
+            '    )\n')
+        marker = '    dbg_feature = feature(name = "dbg")\n'
+        if marker not in config:
+            fail("cannot locate feature insertion point in TensorFlow toolchain template")
+        config = config.replace(marker, marker + '\n' + environment_feature, 1)
+        marker = '                dbg_feature,\n'
+        if marker not in config:
+            fail("cannot locate feature list in TensorFlow toolchain template")
+        config = config.replace(
+            marker,
+            marker + '                openwrt_staging_environment_feature,\n',
+            1)
     if sysroot:
         config = config.replace("builtin_sysroot = None",
                                 f"builtin_sysroot = {json.dumps(str(sysroot))}")
@@ -225,6 +262,8 @@ def main() -> None:
         print(f"toolchain_repository={toolchain_repository}")
     if sysroot:
         print(f"sysroot={sysroot}")
+    if staging_dir:
+        print(f"staging_dir={staging_dir}")
 
 
 def sysconfig_include() -> str:
