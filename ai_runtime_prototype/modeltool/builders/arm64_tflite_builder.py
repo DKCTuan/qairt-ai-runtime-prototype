@@ -8,12 +8,14 @@ def build_shared_library(tflite: Path, output: Path, *, tensorflow_root: Path,
                          toolchain: Path | None, compiler: Path | None,
                          toolchain_config: Path | None,
                          staging_dir: Path | None,
+                         target_libc: str,
                          quantize: str, force: bool) -> Path:
     """Delegate ARM64 model-selective library creation to model_deploy.py."""
     deploy = Path(__file__).resolve().parents[2] / "tools" / "model_deploy.py"
     command = [sys.executable, str(deploy), "static-library", "--shared",
                "--model", str(tflite), "--output", str(output),
                "--tensorflow-root", str(tensorflow_root), "--quantize", quantize,
+               "--target-libc", target_libc,
                "--bazel-batch"]
     if toolchain:
         command.extend(["--aarch64-toolchain", str(toolchain)])

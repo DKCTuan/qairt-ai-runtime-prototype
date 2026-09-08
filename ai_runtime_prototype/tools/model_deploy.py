@@ -1428,7 +1428,11 @@ def command_static_library(args):
             command.append(f'--action_env=STAGING_DIR={staging_dir}')
         if args.aarch64_toolchain:
             toolchain = Path(args.aarch64_toolchain).expanduser().resolve()
-            compiler = (Path(args.aarch64_compiler).expanduser().resolve()
+            # Preserve an OpenWrt compiler symlink name.  Its wrapper selects
+            # gcc/g++ from argv[0], so resolving it to the shared wrapper
+            # script changes its behaviour.
+            compiler = (Path(os.path.abspath(os.fspath(
+                        Path(args.aarch64_compiler).expanduser())))
                         if args.aarch64_compiler else
                         toolchain / 'bin' / 'aarch64-none-linux-gnu-gcc')
             ensure_file(compiler, 'ARM64 cross compiler')
@@ -1449,6 +1453,12 @@ def command_static_library(args):
                     f'{toolchain_config}')
         if not args.shared:
             command.extend(['--define', 'framework_shared_object=false'])
+        if args.target_libc == 'musl':
+            # TensorFlow v2.15's vendored FlatBuffers infers the availability
+            # of glibc's strto*_l functions from _XOPEN_SOURCE.  musl does
+            # not provide those functions, so force FlatBuffers to use its
+            # portable strto* fallback for a musl target.
+            command.append('--copt=-DFLATBUFFERS_LOCALE_INDEPENDENT=0')
         if args.target_config:
             command.append(f'--config={args.target_config}')
         # TensorFlow's elinux config points --host_crosstool_top at the
@@ -1575,6 +1585,8 @@ def build_parser():
                         'the selected ARM64 compiler version')
     p.add_argument('--aarch64-staging-dir', default=None,
                    help='OpenWrt/QSDK staging_dir passed into Bazel build actions')
+    p.add_argument('--target-libc', choices=['glibc', 'musl'], default='glibc',
+                   help='C library ABI of the ARM64 target (default: glibc)')
     p.add_argument('--shared', action='store_true',
                    help='Build libai_model.so containing the model and TFLite runtime')
     p.add_argument('--quantize', choices=['none', 'int8', 'float16'], default='none',
@@ -1600,6 +1612,7 @@ def build_parser():
     p.add_argument('--aarch64-compiler', default=None)
     p.add_argument('--aarch64-toolchain-config', default=None)
     p.add_argument('--aarch64-staging-dir', default=None)
+    p.add_argument('--target-libc', choices=['glibc', 'musl'], default='glibc')
     p.add_argument('--quantize', choices=['none', 'int8', 'float16'], default='none')
     p.add_argument('--force', action='store_true')
     p.add_argument('--keep-build-dir', action='store_true')

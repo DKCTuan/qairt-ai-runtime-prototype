@@ -194,7 +194,13 @@ def main() -> None:
                    (toolchain.parent if args.target_libc == "musl" else None))
     template = tensorflow / "tensorflow/tools/toolchains/embedded/arm-linux/cc_config.bzl.tpl"
     build_template = tensorflow / "tensorflow/tools/toolchains/embedded/arm-linux/aarch64-linux-toolchain.BUILD"
-    compiler = (Path(args.compiler).expanduser().resolve()
+    # Do not resolve the compiler itself: OpenWrt exposes gcc/g++ as symlinks
+    # to one wrapper script.  The wrapper derives the requested program from
+    # argv[0], so resolving ``...-gcc`` to ``...-wrapper.sh`` makes it try to
+    # execute a non-existent ``wrapper.sh.bin``.  An absolute lexical path
+    # keeps the user-selected compiler name intact while still making the
+    # generated Bazel configuration independent of the working directory.
+    compiler = (Path(os.path.abspath(os.fspath(Path(args.compiler).expanduser())))
                 if args.compiler else toolchain / "bin/aarch64-none-linux-gnu-gcc")
     if not template.is_file() or not build_template.is_file():
         fail("TensorFlow embedded ARM toolchain templates were not found; use TensorFlow v2.15 source")

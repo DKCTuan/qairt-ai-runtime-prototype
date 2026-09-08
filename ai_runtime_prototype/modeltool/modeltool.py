@@ -232,6 +232,7 @@ def cmd_build(args) -> None:
                          compiler=path(args.aarch64_compiler),
                          toolchain_config=path(args.aarch64_toolchain_config),
                          staging_dir=path(args.aarch64_staging_dir),
+                         target_libc=args.target_libc,
                          quantize=args.quantize, force=True)
     elf = inspect_shared_library(library, target_libc=args.target_libc,
                                  target_glibc=args.target_glibc)
