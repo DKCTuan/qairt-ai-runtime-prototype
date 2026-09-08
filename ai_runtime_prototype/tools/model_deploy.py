@@ -1418,6 +1418,14 @@ def command_static_library(args):
         if getattr(args, 'bazel_batch', False):
             command.append('--batch')
         command.extend(['build', '-c', 'opt'])
+        if args.aarch64_staging_dir:
+            staging_dir = Path(args.aarch64_staging_dir).expanduser().resolve()
+            if not staging_dir.is_dir():
+                fail(f'ARM64 staging directory not found: {staging_dir}')
+            # OpenWrt compiler wrappers use STAGING_DIR to find their target
+            # headers and libraries. Bazel sanitizes the action environment,
+            # so exporting it only in the caller shell is insufficient.
+            command.append(f'--action_env=STAGING_DIR={staging_dir}')
         if args.aarch64_toolchain:
             toolchain = Path(args.aarch64_toolchain).expanduser().resolve()
             compiler = (Path(args.aarch64_compiler).expanduser().resolve()
@@ -1549,6 +1557,8 @@ def build_parser():
     p.add_argument('--aarch64-toolchain-config', default=None,
                    help='Bazel local_config_embedded_arm repository matching '
                         'the selected ARM64 compiler version')
+    p.add_argument('--aarch64-staging-dir', default=None,
+                   help='OpenWrt/QSDK staging_dir passed into Bazel build actions')
     p.add_argument('--shared', action='store_true',
                    help='Build libai_model.so containing the model and TFLite runtime')
     p.add_argument('--quantize', choices=['none', 'int8', 'float16'], default='none',
@@ -1573,6 +1583,7 @@ def build_parser():
     p.add_argument('--aarch64-toolchain', default=None)
     p.add_argument('--aarch64-compiler', default=None)
     p.add_argument('--aarch64-toolchain-config', default=None)
+    p.add_argument('--aarch64-staging-dir', default=None)
     p.add_argument('--quantize', choices=['none', 'int8', 'float16'], default='none')
     p.add_argument('--force', action='store_true')
     p.add_argument('--keep-build-dir', action='store_true')

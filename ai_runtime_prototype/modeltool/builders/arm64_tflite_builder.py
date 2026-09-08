@@ -7,6 +7,7 @@ from ..core.process import run
 def build_shared_library(tflite: Path, output: Path, *, tensorflow_root: Path,
                          toolchain: Path | None, compiler: Path | None,
                          toolchain_config: Path | None,
+                         staging_dir: Path | None,
                          quantize: str, force: bool) -> Path:
     """Delegate ARM64 model-selective library creation to model_deploy.py."""
     deploy = Path(__file__).resolve().parents[2] / "tools" / "model_deploy.py"
@@ -20,6 +21,8 @@ def build_shared_library(tflite: Path, output: Path, *, tensorflow_root: Path,
         command.extend(["--aarch64-compiler", str(compiler)])
     if toolchain_config:
         command.extend(["--aarch64-toolchain-config", str(toolchain_config)])
+    if staging_dir:
+        command.extend(["--aarch64-staging-dir", str(staging_dir)])
     if force:
         command.append("--force")
     run(command, cwd=deploy.parents[2], log_path=output.with_suffix(".build.log"))

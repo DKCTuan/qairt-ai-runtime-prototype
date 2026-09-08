@@ -231,6 +231,7 @@ def cmd_build(args) -> None:
                          toolchain=path(args.aarch64_toolchain),
                          compiler=path(args.aarch64_compiler),
                          toolchain_config=path(args.aarch64_toolchain_config),
+                         staging_dir=path(args.aarch64_staging_dir),
                          quantize=args.quantize, force=True)
     elf = inspect_shared_library(library, target_libc=args.target_libc,
                                  target_glibc=args.target_glibc)
@@ -280,6 +281,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--aarch64-compiler",
                    help="Cross GCC selected in the generated Bazel configuration")
     p.add_argument("--aarch64-toolchain-config")
+    p.add_argument("--aarch64-staging-dir",
+                   help="OpenWrt/QSDK staging_dir passed to Bazel compile actions")
     p.add_argument("--target-libc", choices=["glibc", "musl"], default="glibc",
                    help="C library ABI on the deployment target (default: glibc)")
     p.add_argument("--target-glibc", default="2.32",
