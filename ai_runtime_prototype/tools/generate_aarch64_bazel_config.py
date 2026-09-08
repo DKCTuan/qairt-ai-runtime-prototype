@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import shutil
@@ -43,6 +44,42 @@ def compiler_target(compiler: Path) -> str:
     if not target.startswith("aarch64-"):
         fail(f"compiler is not an aarch64 cross compiler: {compiler}")
     return target
+
+
+def compiler_include_directories(compiler: Path, *, sysroot: Path | None,
+                                 staging_dir: Path | None) -> list[Path]:
+    """Return canonical C++ include paths reported by the cross compiler."""
+    command = [str(compiler)]
+    if sysroot:
+        command.append(f"--sysroot={sysroot}")
+    command.extend(["-E", "-x", "c++", "-", "-v"])
+    environment = os.environ.copy()
+    if staging_dir:
+        environment["STAGING_DIR"] = str(staging_dir)
+    result = subprocess.run(command, input="", capture_output=True, text=True,
+                            env=environment)
+    if result.returncode != 0:
+        fail(f"cannot query compiler include paths from {compiler}:\n{result.stderr}")
+    directories: list[Path] = []
+    collecting = False
+    for raw_line in result.stderr.splitlines():
+        line = raw_line.strip()
+        if line == "#include <...> search starts here:":
+            collecting = True
+            continue
+        if collecting and line == "End of search list.":
+            break
+        if not collecting or not line:
+            continue
+        suffix = " (framework directory)"
+        if line.endswith(suffix):
+            line = line[:-len(suffix)]
+        candidate = Path(line).resolve()
+        if candidate.is_dir() and candidate not in directories:
+            directories.append(candidate)
+    if not directories:
+        fail(f"compiler did not report any C++ include directories: {compiler}")
+    return directories
 
 
 def write_build(destination: Path, *, include_compiler_wrapper: bool) -> None:
@@ -171,6 +208,8 @@ def main() -> None:
 
     version = compiler_version(compiler)
     target = compiler_target(compiler)
+    reported_include_directories = compiler_include_directories(
+        compiler, sysroot=sysroot, staging_dir=staging_dir)
     config = template.read_text(encoding="utf-8")
     config = config.replace("%{AARCH64_COMPILER_PATH}%", str(toolchain))
     config = config.replace("%{PYTHON_INCLUDE_PATH}%", sysconfig_include())
@@ -229,6 +268,18 @@ def main() -> None:
         config = config.replace(
             marker,
             marker + '                openwrt_staging_environment_feature,\n',
+            1)
+        include_marker = (
+            '    if (ctx.attr.cpu == "aarch64"):\n'
+            '        cxx_builtin_include_directories = [\n')
+        if include_marker not in config:
+            fail("cannot locate AArch64 builtin include list in TensorFlow template")
+        reported_lines = ''.join(
+            f'                {json.dumps(str(directory))},\n'
+            for directory in reported_include_directories)
+        config = config.replace(
+            include_marker,
+            include_marker + reported_lines,
             1)
     if sysroot:
         config = config.replace("builtin_sysroot = None",
