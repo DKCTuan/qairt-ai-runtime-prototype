@@ -1447,6 +1447,16 @@ def command_static_library(args):
                 command.append(
                     '--override_repository=local_config_embedded_arm='
                     f'{toolchain_config}')
+            # TensorFlow's elinux config points --host_crosstool_top at the
+            # generic Bazel tools suite. With newer vendor cross compilers,
+            # exec-config dependencies such as FlatBuffers' `flatc` can then
+            # incorrectly select the ARM64 target compiler. These programs
+            # must be built for and executed on the x86_64 build machine.
+            if os.uname().machine in ('x86_64', 'amd64'):
+                command.extend([
+                    '--host_cpu=k8',
+                    '--host_crosstool_top=@local_config_cc//:toolchain',
+                ])
         if not args.shared:
             command.extend(['--define', 'framework_shared_object=false'])
         if args.target_config:
