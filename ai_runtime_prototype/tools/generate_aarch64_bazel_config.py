@@ -89,14 +89,15 @@ def write_toolchain_wrapper(destination: Path, toolchain: Path, target: str,
         'filegroup(name = "objdump", srcs = ["sdk/bin/{target}-objdump"])\n'
         'filegroup(name = "strip", srcs = ["sdk/bin/{target}-strip"])\n'
         'filegroup(name = "as", srcs = ["sdk/bin/{target}-as"])\n\n'
+        # Do not recursively glob a vendor SDK.  OpenWrt QSDK target trees
+        # commonly contain compatibility symlink loops such as lib64 -> lib,
+        # which causes Bazel analysis to fail before compilation.  The
+        # compiler paths in cc_config.bzl are absolute QSDK paths and the
+        # TensorFlow build uses standalone spawning, so declaring its tools is
+        # sufficient and does not traverse the SDK filesystem.
         'filegroup(\n'
         '    name = "compiler_pieces",\n'
-        '    srcs = glob([\n'
-        '        "sdk/{target}/**",\n'
-        '        "sdk/libexec/**",\n'
-        '        "sdk/lib/gcc/{target}/**",\n'
-        '        "sdk/include/**",\n'
-        '    ]),\n'
+        '    srcs = [":ar", ":as", ":gcc", ":ld", ":nm", ":objcopy", ":objdump", ":strip"],\n'
         ')\n\n'
         'filegroup(\n'
         '    name = "compiler_components",\n'
