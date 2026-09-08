@@ -36,6 +36,60 @@ The application deployed to an ARM64 Linux target needs the resulting `.so`
 and the generated `ai_model.h` / `ai_runtime.h` headers at compile time.  The
 model and TensorFlow Lite CPU runtime are embedded in the `.so`.
 
+## Create the portable ARM64 Bazel configuration
+
+TensorFlow's default embedded-ARM configuration is generated in Bazel's cache
+and therefore records cache paths belonging to one development machine.  Do
+not copy that generated directory to another host.  After installing the ARM
+GNU toolchain, create a local configuration on each host instead:
+
+```bash
+cd ~/qairt_sdk
+export ARM64_TOOLCHAIN="$HOME/toolchains/gcc-arm-10.2-aarch64"
+
+python3 ai_runtime_prototype/tools/generate_aarch64_bazel_config.py \
+  --tensorflow-root ~/tensorflow \
+  --toolchain "$ARM64_TOOLCHAIN" \
+  --output "$HOME/toolchains/tf-arm10-bazel-config"
+```
+
+The generator detects the installed GCC version, writes paths to the selected
+toolchain rather than `~/.cache/bazel`, and creates the `BUILD.bazel` /
+`WORKSPACE` files required by Bazel.  It is intentionally ARM64-only; ARM32 is
+not configured or tested by this project.
+
+## Generic ARM64 model runner
+
+`tflite_qnn_prototype/examples/ai_model_runner.c` is a reusable client for a
+generated `libai_model.so`.  It calls `ai_model_get_io_count()` after
+initialisation, so it does not hard-code the legacy QoS model's 240 values or
+TinyGRU's 270 values.  It accepts one or more consecutive input tensors from a
+raw file or standard input; every tensor is little-endian `float32` and must
+follow the model's feature order and preprocessing contract.
+
+Build it beside a generated library:
+
+```bash
+"$ARM64_TOOLCHAIN/bin/aarch64-none-linux-gnu-gcc" \
+  -std=c11 -O2 -Wall -Wextra \
+  tflite_qnn_prototype/examples/ai_model_runner.c \
+  -Idist/tiny_gru/arm64 -Ldist/tiny_gru/arm64 \
+  -Wl,-rpath,'$ORIGIN' -lai_model \
+  -o dist/tiny_gru/arm64/ai_model_runner
+```
+
+On the target, place `ai_model_runner` and `libai_model.so` in the same
+directory, then run either:
+
+```bash
+./ai_model_runner input.raw
+producer | ./ai_model_runner -
+```
+
+The runner is generic only at the tensor-I/O layer.  Packet parsing, feature
+extraction, normalisation and mapping `label` to a traffic class remain the
+responsibility of the caller/model contract.
+
 ## TinyGRU PyTorch checkpoint
 
 The current verified PyTorch adapter supports the traffic TinyGRU checkpoint

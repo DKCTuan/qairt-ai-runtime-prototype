@@ -7,6 +7,20 @@ int ai_model_init(void)
     return dl_init();
 }
 
+int ai_model_get_io_count(size_t *input_count, size_t *output_count)
+{
+    int inputs = 0;
+    int outputs = 0;
+
+    if (input_count == NULL || output_count == NULL ||
+        dl_get_io_count(&inputs, &outputs) != 0 || inputs < 0 || outputs < 0) {
+        return -1;
+    }
+    *input_count = (size_t)inputs;
+    *output_count = (size_t)outputs;
+    return 0;
+}
+
 int ai_model_predict(const float *input, size_t input_count,
                      float *scores, size_t score_capacity,
                      size_t *score_count, int *label, double *latency_ms)

@@ -1409,6 +1409,7 @@ def command_static_library(args):
                 '{\n'
                 '  global:\n'
                 '    ai_model_init;\n'
+                '    ai_model_get_io_count;\n'
                 '    ai_model_predict;\n'
                 '    ai_model_deinit;\n'
                 '  local: *;\n'
