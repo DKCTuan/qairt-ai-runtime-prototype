@@ -3,8 +3,10 @@
 
 TensorFlow's generated ``local_config_embedded_arm`` writes Bazel-cache paths
 into cc_config.bzl.  Such a directory cannot be copied to another host.  This
-helper instead writes absolute paths to the selected ARM GNU toolchain and
+helper instead writes absolute paths to the selected ARM64 toolchain and
 creates the minimal ARM64-only repository required by --config=elinux_aarch64.
+It supports the standard ARM GNU compiler and vendor compilers such as
+OpenWrt's ``aarch64-openwrt-linux-musl-gcc``.
 """
 from __future__ import annotations
 
@@ -28,6 +30,17 @@ def compiler_version(compiler: Path) -> str:
     if not version or any(part and not part.isdigit() for part in version.split(".")):
         fail(f"cannot determine GCC version from {compiler}: {version!r}")
     return version
+
+
+def compiler_target(compiler: Path) -> str:
+    """Derive the target triplet from an aarch64 ``*-gcc`` executable."""
+    name = compiler.name
+    if not name.endswith("-gcc"):
+        fail(f"compiler name must end in -gcc: {compiler}")
+    target = name[:-4]
+    if not target.startswith("aarch64-"):
+        fail(f"compiler is not an aarch64 cross compiler: {compiler}")
+    return target
 
 
 def write_build(destination: Path) -> None:
@@ -62,7 +75,10 @@ def main() -> None:
     parser.add_argument("--tensorflow-root", required=True,
                         help="TensorFlow v2.15 source checkout")
     parser.add_argument("--toolchain", required=True,
-                        help="ARM GNU aarch64-none-linux-gnu toolchain root")
+                        help="ARM64 cross-toolchain root")
+    parser.add_argument("--compiler", default=None,
+                        help="cross GCC inside --toolchain; defaults to "
+                             "bin/aarch64-none-linux-gnu-gcc")
     parser.add_argument("--output", required=True,
                         help="new local_config_embedded_arm repository directory")
     parser.add_argument("--force", action="store_true",
@@ -74,7 +90,8 @@ def main() -> None:
     output = Path(args.output).expanduser().resolve()
     template = tensorflow / "tensorflow/tools/toolchains/embedded/arm-linux/cc_config.bzl.tpl"
     build_template = tensorflow / "tensorflow/tools/toolchains/embedded/arm-linux/aarch64-linux-toolchain.BUILD"
-    compiler = toolchain / "bin/aarch64-none-linux-gnu-gcc"
+    compiler = (Path(args.compiler).expanduser().resolve()
+                if args.compiler else toolchain / "bin/aarch64-none-linux-gnu-gcc")
     if not template.is_file() or not build_template.is_file():
         fail("TensorFlow embedded ARM toolchain templates were not found; use TensorFlow v2.15 source")
     if not compiler.is_file():
@@ -86,17 +103,19 @@ def main() -> None:
     output.mkdir(parents=True)
 
     version = compiler_version(compiler)
+    target = compiler_target(compiler)
     config = template.read_text(encoding="utf-8")
     config = config.replace("%{AARCH64_COMPILER_PATH}%", str(toolchain))
     config = config.replace("%{PYTHON_INCLUDE_PATH}%", sysconfig_include())
     # ARMHF is deliberately absent from the generated BUILD.  Leave its
     # inactive branch syntactically valid without pretending ARMHF is tested.
     config = config.replace("%{ARMHF_COMPILER_PATH}%", "/opt/armhf-toolchain-not-configured")
-    # The upstream v2.15 template names GCC 11.3.1.  A developer may already
-    # have edited that template while experimenting, so replace whichever
-    # version occurs instead of assuming the pristine value.
-    config = re.sub(r"aarch64-none-linux-gnu/\\d+\\.\\d+\\.\\d+",
-                    f"aarch64-none-linux-gnu/{version}", config)
+    # TensorFlow v2.15 embeds both the GNU target name and GCC 11.3.1 in its
+    # include and tool paths.  Replace them instead of asking a vendor SDK to
+    # expose misleading aarch64-none-linux-gnu compatibility symlinks.
+    config = config.replace("aarch64-none-linux-gnu", target)
+    config = re.sub(rf"{re.escape(target)}/\\d+\\.\\d+\\.\\d+",
+                    f"{target}/{version}", config)
     (output / "cc_config.bzl").write_text(config, encoding="utf-8")
     write_build(output / "BUILD.bazel")
     (output / "WORKSPACE").write_text(
@@ -106,13 +125,17 @@ def main() -> None:
     # user has not already supplied one, so the helper is non-destructive.
     toolchain_build = toolchain / "BUILD.bazel"
     if not toolchain_build.exists() and not (toolchain / "BUILD").exists():
-        shutil.copy2(build_template, toolchain_build)
+        build = build_template.read_text(encoding="utf-8")
+        toolchain_build.write_text(
+            build.replace("aarch64-none-linux-gnu", target), encoding="utf-8")
     workspace = toolchain / "WORKSPACE.bazel"
     if not workspace.exists() and not (toolchain / "WORKSPACE").exists():
         workspace.write_text('workspace(name = "aarch64_linux_toolchain")\n', encoding="utf-8")
 
     print("status=success")
     print(f"gcc_version={version}")
+    print(f"target={target}")
+    print(f"compiler={compiler}")
     print(f"config={output}")
     print(f"toolchain={toolchain}")
 

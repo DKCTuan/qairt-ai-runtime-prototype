@@ -9,8 +9,9 @@ def _version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in value.removeprefix("GLIBC_").split("."))
 
 
-def inspect_shared_library(path: Path, *, target_glibc: str | None = None) -> dict:
-    """Check architecture, dynamic dependencies and highest GLIBC requirement."""
+def inspect_shared_library(path: Path, *, target_libc: str = "glibc",
+                           target_glibc: str | None = None) -> dict:
+    """Check architecture and whether its libc ABI matches the selected target."""
     commands = {
         "header": ["readelf", "-h", str(path)],
         "dynamic": ["readelf", "-d", str(path)],
@@ -35,8 +36,17 @@ def inspect_shared_library(path: Path, *, target_glibc: str | None = None) -> di
         "architecture": "AArch64",
         "dependencies": dependencies,
         "glibc_max": highest,
+        "target_libc": target_libc,
         "status": "PASS",
     }
+    if target_libc == "musl":
+        if highest:
+            raise ModelToolError(
+                "ABI_CHECK_FAILED",
+                f"musl target cannot load library requiring {highest}")
+        return report
+    if target_libc != "glibc":
+        raise ModelToolError("ABI_CHECK_FAILED", f"unsupported target libc: {target_libc}")
     if target_glibc and highest:
         required = _version_tuple(highest)
         target = _version_tuple(target_glibc if target_glibc.startswith("GLIBC_")

@@ -229,9 +229,11 @@ def cmd_build(args) -> None:
     library = arm64_dir / f"lib{source.stem}.so"
     build_shared_library(tflite, library, tensorflow_root=path(args.tensorflow_root),
                          toolchain=path(args.aarch64_toolchain),
+                         compiler=path(args.aarch64_compiler),
                          toolchain_config=path(args.aarch64_toolchain_config),
                          quantize=args.quantize, force=True)
-    elf = inspect_shared_library(library, target_glibc=args.target_glibc)
+    elf = inspect_shared_library(library, target_libc=args.target_libc,
+                                 target_glibc=args.target_glibc)
     write_json(arm64_dir / "elf_report.json", elf)
     print(json.dumps({"status": "success", "artifact_dir": str(root),
                       "library": str(library), "manifest": str(root / "manifest.json"),
@@ -275,8 +277,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir")
     p.add_argument("--tensorflow-root", default=str(Path.home() / "tensorflow"))
     p.add_argument("--aarch64-toolchain")
+    p.add_argument("--aarch64-compiler",
+                   help="Cross GCC selected in the generated Bazel configuration")
     p.add_argument("--aarch64-toolchain-config")
-    p.add_argument("--target-glibc", default="2.32")
+    p.add_argument("--target-libc", choices=["glibc", "musl"], default="glibc",
+                   help="C library ABI on the deployment target (default: glibc)")
+    p.add_argument("--target-glibc", default="2.32",
+                   help="Maximum target GLIBC version; ignored for --target-libc musl")
     p.add_argument("--quantize", choices=["none", "int8", "float16"], default="none")
     p.add_argument("--force", action="store_true")
     p.add_argument("--allow-synthetic-validation", action="store_true")

@@ -1420,8 +1420,10 @@ def command_static_library(args):
         command.extend(['build', '-c', 'opt'])
         if args.aarch64_toolchain:
             toolchain = Path(args.aarch64_toolchain).expanduser().resolve()
-            ensure_file(toolchain / 'bin' / 'aarch64-none-linux-gnu-gcc',
-                        'ARM64 cross compiler')
+            compiler = (Path(args.aarch64_compiler).expanduser().resolve()
+                        if args.aarch64_compiler else
+                        toolchain / 'bin' / 'aarch64-none-linux-gnu-gcc')
+            ensure_file(compiler, 'ARM64 cross compiler')
             if not ((toolchain / 'BUILD').is_file() or
                     (toolchain / 'BUILD.bazel').is_file()):
                 fail(f'Bazel repository BUILD file not found in toolchain: {toolchain}')
@@ -1540,6 +1542,10 @@ def build_parser():
     p.add_argument('--aarch64-toolchain', default=None,
                    help='Bazel repository containing an ARM64 GNU toolchain; '
                         'use a sysroot no newer than the target glibc')
+    p.add_argument('--aarch64-compiler', default=None,
+                   help='Cross GCC selected in the generated Bazel configuration; '
+                        'required for vendor toolchains whose compiler is not '
+                        'aarch64-none-linux-gnu-gcc')
     p.add_argument('--aarch64-toolchain-config', default=None,
                    help='Bazel local_config_embedded_arm repository matching '
                         'the selected ARM64 compiler version')
@@ -1565,6 +1571,7 @@ def build_parser():
                    help='Run Bazel without its persistent server (slower, useful on WSL/CI)')
     p.add_argument('--target-config', default='elinux_aarch64')
     p.add_argument('--aarch64-toolchain', default=None)
+    p.add_argument('--aarch64-compiler', default=None)
     p.add_argument('--aarch64-toolchain-config', default=None)
     p.add_argument('--quantize', choices=['none', 'int8', 'float16'], default='none')
     p.add_argument('--force', action='store_true')

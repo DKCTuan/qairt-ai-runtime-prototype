@@ -5,7 +5,8 @@ from ..core.process import run
 
 
 def build_shared_library(tflite: Path, output: Path, *, tensorflow_root: Path,
-                         toolchain: Path | None, toolchain_config: Path | None,
+                         toolchain: Path | None, compiler: Path | None,
+                         toolchain_config: Path | None,
                          quantize: str, force: bool) -> Path:
     """Delegate ARM64 model-selective library creation to model_deploy.py."""
     deploy = Path(__file__).resolve().parents[2] / "tools" / "model_deploy.py"
@@ -15,6 +16,8 @@ def build_shared_library(tflite: Path, output: Path, *, tensorflow_root: Path,
                "--bazel-batch"]
     if toolchain:
         command.extend(["--aarch64-toolchain", str(toolchain)])
+    if compiler:
+        command.extend(["--aarch64-compiler", str(compiler)])
     if toolchain_config:
         command.extend(["--aarch64-toolchain-config", str(toolchain_config)])
     if force:
