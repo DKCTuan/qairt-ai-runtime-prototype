@@ -118,6 +118,9 @@ def main() -> None:
     parser.add_argument("--compiler", default=None,
                         help="cross GCC inside --toolchain; defaults to "
                              "bin/aarch64-none-linux-gnu-gcc")
+    parser.add_argument("--target-libc", choices=["glibc", "musl"], default="glibc",
+                        help="target C library ABI; musl removes host glibc "
+                             "headers from TensorFlow's embedded template")
     parser.add_argument("--output", required=True,
                         help="new local_config_embedded_arm repository directory")
     parser.add_argument("--toolchain-repository-output", default=None,
@@ -152,6 +155,15 @@ def main() -> None:
     # ARMHF is deliberately absent from the generated BUILD.  Leave its
     # inactive branch syntactically valid without pretending ARMHF is tested.
     config = config.replace("%{ARMHF_COMPILER_PATH}%", "/opt/armhf-toolchain-not-configured")
+    if args.target_libc == "musl":
+        # TensorFlow's stock embedded template unconditionally adds the host
+        # /usr/include.  That mixes host glibc headers with OpenWrt musl
+        # headers and breaks C++ compilation (for example __BEGIN_DECLS and
+        # glibc-only strtoull_l).  The QSDK compiler already supplies its own
+        # complete musl include search path.
+        config = config.replace(
+            '                                "-isystem",\n'
+            '                                "/usr/include/",\n', '')
     # TensorFlow v2.15 embeds both the GNU target name and GCC 11.3.1 in its
     # include and tool paths.  Replace them instead of asking a vendor SDK to
     # expose misleading aarch64-none-linux-gnu compatibility symlinks.
