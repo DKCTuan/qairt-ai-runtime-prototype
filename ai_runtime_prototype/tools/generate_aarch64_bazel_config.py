@@ -74,9 +74,15 @@ def compiler_include_directories(compiler: Path, *, sysroot: Path | None,
         suffix = " (framework directory)"
         if line.endswith(suffix):
             line = line[:-len(suffix)]
-        candidate = Path(line).resolve()
-        if candidate.is_dir() and candidate not in directories:
-            directories.append(candidate)
+        # Keep the compiler-reported lexical path as well as its resolved
+        # destination. OpenWrt exposes sys-include through a symlink, and
+        # Bazel's undeclared-inclusion check compares the path emitted in the
+        # dependency file rather than treating both spellings as equivalent.
+        lexical = Path(os.path.abspath(os.path.normpath(line)))
+        candidates = (lexical, lexical.resolve())
+        for candidate in candidates:
+            if candidate.is_dir() and candidate not in directories:
+                directories.append(candidate)
     if not directories:
         fail(f"compiler did not report any C++ include directories: {compiler}")
     return directories
