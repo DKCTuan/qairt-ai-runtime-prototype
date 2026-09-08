@@ -1457,9 +1457,15 @@ def command_static_library(args):
         # incorrectly select the ARM64 target compiler. These overrides must
         # occur after --config so its expansion cannot replace them.
         if args.aarch64_toolchain and os.uname().machine in ('x86_64', 'amd64'):
+            host_cc = shutil.which('gcc')
+            host_cxx = shutil.which('g++')
+            if not host_cc or not host_cxx:
+                fail('native host gcc/g++ not found; required to build Bazel exec tools')
             command.extend([
                 '--host_cpu=k8',
                 '--host_crosstool_top=@local_config_cc//:toolchain',
+                f'--repo_env=CC={host_cc}',
+                f'--repo_env=CXX={host_cxx}',
             ])
         command.extend([
             '--copt=-Os',
