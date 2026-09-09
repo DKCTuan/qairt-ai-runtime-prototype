@@ -8,10 +8,11 @@ GRU_INCLUDE ?= ../tflite_qnn_prototype/include
 ifneq ($(GRU_LIBRARY),)
 GRU_FLAGS = -DTRAFFIC_P16_WITH_GRU -I$(GRU_INCLUDE)
 GRU_LINK = -L$(dir $(GRU_LIBRARY)) -l:$(notdir $(GRU_LIBRARY)) -Wl,-rpath,'$$ORIGIN'
+APP_GRU_LINK = -Wl,-rpath-link,$(dir $(GRU_LIBRARY))
 endif
 
 .PHONY: all test
-all: $(OUT)/libtraffic_p16.so
+all: $(OUT)/libtraffic_p16.so $(OUT)/app_p16_arm64
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -23,6 +24,11 @@ $(OUT)/libtraffic_p16.so: traffic_p16.c traffic_p16.h \
 		generated/traffic_p16_deployment_config.c $(GRU_LINK) -lm \
 		-Wl,--gc-sections -Wl,--version-script=exports.map \
 		-Wl,-soname,libtraffic_p16.so -o $@
+	$(STRIP) --strip-unneeded $@
+
+$(OUT)/app_p16_arm64: examples/p16_smoke.c traffic_p16.h generated/traffic_p16_deployment_config.h $(OUT)/libtraffic_p16.so
+	$(CC) $(CFLAGS) examples/p16_smoke.c -L$(OUT) -ltraffic_p16 $(APP_GRU_LINK) \
+		-Wl,-rpath,'$$ORIGIN' -o $@
 	$(STRIP) --strip-unneeded $@
 
 test:

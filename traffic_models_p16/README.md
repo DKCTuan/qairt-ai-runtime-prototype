@@ -39,3 +39,7 @@ make OUT=dist/traffic_p16 \
   CC=aarch64-openwrt-linux-musl-gcc \
   STRIP=aarch64-openwrt-linux-musl-strip
 ```
+
+The build also produces `app_p16_arm64`, a deterministic smoke client. It
+exercises the full raw-packet preprocessing path and is not a substitute for
+parity validation using a real captured window.
