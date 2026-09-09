@@ -1411,6 +1411,10 @@ def command_static_library(args):
                 '    ai_model_init;\n'
                 '    ai_model_get_io_count;\n'
                 '    ai_model_predict;\n'
+                '    ai_model_get_tensor_count;\n'
+                '    ai_model_get_input_info;\n'
+                '    ai_model_get_output_info;\n'
+                '    ai_model_predict_tensors;\n'
                 '    ai_model_deinit;\n'
                 '  local: *;\n'
                 '};\n', encoding='utf-8')
