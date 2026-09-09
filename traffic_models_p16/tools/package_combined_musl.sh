@@ -1,43 +1,39 @@
 #!/usr/bin/env bash
-# Package the already-built RF V6 and TinyGRU P16 musl artifacts for handoff.
+# Package the unified Random Forest + TinyGRU P16 musl SDK for handoff.
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --rf-dir DIR --p16-dir DIR --target-root DIR --output-root DIR" >&2
+    echo "usage: $0 --sdk-dir DIR --target-root DIR --output-root DIR" >&2
     exit 2
 }
 
-rf_dir= p16_dir= target_root= output_root=
+sdk_dir= target_root= output_root=
 while (($#)); do
     case "$1" in
-        --rf-dir) rf_dir=${2:?}; shift 2 ;;
-        --p16-dir) p16_dir=${2:?}; shift 2 ;;
+        --sdk-dir) sdk_dir=${2:?}; shift 2 ;;
         --target-root) target_root=${2:?}; shift 2 ;;
         --output-root) output_root=${2:?}; shift 2 ;;
         *) usage ;;
     esac
 done
-[[ -n $rf_dir && -n $p16_dir && -n $target_root && -n $output_root ]] || usage
+[[ -n $sdk_dir && -n $target_root && -n $output_root ]] || usage
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 for file in \
-    "$rf_dir/libtraffic_models.so" \
-    "$rf_dir/libtiny_gru_float32.so" \
-    "$p16_dir/libtraffic_p16.so" \
-    "$p16_dir/libtiny_gru_p16_float32.so" \
-    "$p16_dir/app_p16_arm64"; do
+    "$sdk_dir/libtraffic_ai.so" \
+    "$sdk_dir/libtiny_gru_p16_float32.so" \
+    "$sdk_dir/app_traffic_ai_arm64"; do
     [[ -f $file ]] || { echo "error: missing artifact: $file" >&2; exit 1; }
 done
 
 mkdir -p "$output_root"
-name="traffic_ai_qsdk_musl_rf_p16_$(date +%Y%m%d_%H%M%S)"
+name="traffic_ai_qsdk_musl_unified_rf_p16_$(date +%Y%m%d_%H%M%S)"
 package="$output_root/$name"
 mkdir -p "$package/bin" "$package/include" "$package/lib" "$package/docs"
 
-cp "$rf_dir/libtraffic_models.so" "$rf_dir/libtiny_gru_float32.so" "$package/lib/"
-cp "$p16_dir/libtraffic_p16.so" "$p16_dir/libtiny_gru_p16_float32.so" "$package/lib/"
-cp "$p16_dir/app_p16_arm64" "$package/bin/"
+cp "$sdk_dir/libtraffic_ai.so" "$sdk_dir/libtiny_gru_p16_float32.so" "$package/lib/"
+cp "$sdk_dir/app_traffic_ai_arm64" "$package/bin/"
 cp "$repo_root/traffic_models/traffic_models.h" "$package/include/"
 cp "$repo_root/traffic_models_p16/traffic_p16.h" "$package/include/"
 cp "$repo_root/traffic_models_p16/generated/traffic_p16_deployment_config.h" "$package/include/"
