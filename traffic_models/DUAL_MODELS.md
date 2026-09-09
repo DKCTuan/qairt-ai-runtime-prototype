@@ -64,9 +64,11 @@ khác nhau. GRU dùng packet giả trong `run_gru`, chuẩn hóa đúng một l�
 `./app_arm64` mặc định chạy RF. API thư viện có thể gọi GRU nhiều lần sau một
 lần init; deinit khi kết thúc. Các lời gọi GRU hiện cần tuần tự.
 
-Có thể kiểm thử GRU bằng file 270 float32 đã chuẩn hóa, packet-major:
-`./app_arm64 gru input.raw`. File phải đúng 1080 byte, không có header/text.
-API `traffic_gru_predict` nhận thẳng con trỏ array, không yêu cầu file.
+Có thể kiểm thử GRU bằng file 270 raw float32, packet-major:
+`./app_arm64 gru input.raw`. App chuẩn hóa đúng một lần trước inference. File
+phải đúng 1080 byte, không có header/text. Với file đã chuẩn hóa ngoài app,
+dùng `./app_arm64 gru-normalized input.raw`. API `traffic_gru_predict` nhận
+thẳng tensor đã chuẩn hóa; caller dùng `traffic_gru_prepare` cho raw tensor.
 
 ## Kết quả build hiện tại
 

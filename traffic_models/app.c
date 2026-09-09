@@ -24,18 +24,26 @@ static int run_rf(void) {
     return 0;
 }
 
-static int run_gru(const char *raw_path) {
+static int run_gru(const char *input_path, int already_normalized) {
+    float raw[TRAFFIC_GRU_FEATURES];
     float input[TRAFFIC_GRU_FEATURES];
-    if (raw_path) {
-        /* Optional test file: exactly 270 already normalized float32 values. */
-        FILE *fp = fopen(raw_path, "rb");
-        if (!fp) { perror(raw_path); return 1; }
-        size_t n = fread(input, sizeof(float), TRAFFIC_GRU_FEATURES, fp);
+    if (input_path) {
+        /* A file passed to "gru" is raw [90][3] data.  Normalize it here so
+         * this test app has the same contract as a production caller. */
+        FILE *fp = fopen(input_path, "rb");
+        if (!fp) { perror(input_path); return 1; }
+        size_t n = fread(raw, sizeof(float), TRAFFIC_GRU_FEATURES, fp);
         int extra = fgetc(fp);
         int failed = ferror(fp);
         fclose(fp);
         if (n != TRAFFIC_GRU_FEATURES || extra != EOF || failed) {
             fprintf(stderr, "GRU input file must contain exactly 1080 bytes\n");
+            return 1;
+        }
+        if (already_normalized) {
+            memcpy(input, raw, sizeof(input));
+        } else if (traffic_gru_prepare(raw, TRAFFIC_GRU_FEATURES, input)) {
+            fprintf(stderr, "GRU preprocessing failed\n");
             return 1;
         }
     } else {
@@ -63,13 +71,14 @@ static int run_gru(const char *raw_path) {
 
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "rf";
-    if (argc > 3 || (strcmp(mode, "rf") && strcmp(mode, "gru") && strcmp(mode, "both")) ||
+    if (argc > 3 || (strcmp(mode, "rf") && strcmp(mode, "gru") &&
+                     strcmp(mode, "gru-normalized") && strcmp(mode, "both")) ||
         (argc == 3 && !strcmp(mode, "rf"))) {
-        fprintf(stderr, "Usage: %s [rf|gru|both] [normalized_gru.raw]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [rf|gru|gru-normalized|both] [gru_input.raw]\n", argv[0]);
         return 1;
     }
     if ((!strcmp(mode, "rf") || !strcmp(mode, "both")) && run_rf()) return 1;
-    if (!strcmp(mode, "gru") || !strcmp(mode, "both"))
-        return run_gru(argc == 3 ? argv[2] : NULL);
+    if (!strcmp(mode, "gru") || !strcmp(mode, "gru-normalized") || !strcmp(mode, "both"))
+        return run_gru(argc == 3 ? argv[2] : NULL, !strcmp(mode, "gru-normalized"));
     return 0;
 }

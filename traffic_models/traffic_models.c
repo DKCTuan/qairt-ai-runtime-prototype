@@ -40,6 +40,23 @@ int traffic_gru_prepare(const float *raw, size_t count, float *out) {
     }
     return valid(out, count, TRAFFIC_GRU_FEATURES) ? TRAFFIC_OK : TRAFFIC_INVALID_INPUT;
 }
+int traffic_gru_prepare_packets(const uint64_t *timestamp_us, const int8_t *direction,
+                                const uint32_t *ip_total_length, size_t packet_count,
+                                float *normalized) {
+    if (!timestamp_us || !direction || !ip_total_length || !normalized ||
+        packet_count != TRAFFIC_GRU_PACKETS) return TRAFFIC_INVALID_INPUT;
+    float raw[TRAFFIC_GRU_FEATURES];
+    for (size_t packet = 0; packet < packet_count; ++packet) {
+        if ((packet && timestamp_us[packet] < timestamp_us[packet - 1]) ||
+            (direction[packet] != -1 && direction[packet] != 1))
+            return TRAFFIC_INVALID_INPUT;
+        raw[3 * packet] = packet == 0 ? 0.0f :
+            (float)((timestamp_us[packet] - timestamp_us[packet - 1]) * 1e-6);
+        raw[3 * packet + 1] = (float)direction[packet];
+        raw[3 * packet + 2] = (float)ip_total_length[packet];
+    }
+    return traffic_gru_prepare(raw, TRAFFIC_GRU_FEATURES, normalized);
+}
 int traffic_gru_init(void) {
 #ifdef TRAFFIC_WITH_GRU
     if (gru_ready) return TRAFFIC_OK;
