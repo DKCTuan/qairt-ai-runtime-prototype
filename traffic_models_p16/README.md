@@ -29,3 +29,13 @@ python3 tools/generate_p16_deployment_config.py \
 
 The model ABI is verified at initialization. It accepts only TFLite input 0
 `float32 [1,90,3]`, input 1 `int32 [1,90]`, and output `float32 [1,5]`.
+
+To build the P16 wrapper alongside its generated model library:
+
+```bash
+make OUT=dist/traffic_p16 \
+  GRU_LIBRARY=dist/tiny_gru_p16/arm64/libtiny_gru_p16_float32.so \
+  GRU_INCLUDE=dist/tiny_gru_p16/arm64 \
+  CC=aarch64-openwrt-linux-musl-gcc \
+  STRIP=aarch64-openwrt-linux-musl-strip
+```

@@ -1,0 +1,11 @@
+{
+  global:
+    traffic_p16_prepare_packets;
+    traffic_p16_model_init;
+    traffic_p16_model_deinit;
+    traffic_p16_predict;
+    traffic_p16_predict_packets;
+    traffic_p16_default_config;
+    traffic_p16_class_name;
+  local: *;
+};
