@@ -175,3 +175,15 @@ int traffic_p16_predict(const float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS],
     return TRAFFIC_P16_MODEL_UNAVAILABLE;
 #endif
 }
+
+int traffic_p16_predict_packets(const traffic_p16_packet_t *packets,
+                                size_t packet_count,
+                                const traffic_p16_config_t *config,
+                                traffic_p16_result_t *result)
+{
+    float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS];
+    int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE];
+    int status = traffic_p16_prepare_packets(packets, packet_count, config, numeric, p16_ids);
+    if (status != TRAFFIC_P16_OK) return status;
+    return traffic_p16_predict(numeric, p16_ids, result);
+}

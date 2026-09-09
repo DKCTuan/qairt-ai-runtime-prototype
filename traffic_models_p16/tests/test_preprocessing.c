@@ -1,4 +1,5 @@
 #include "traffic_p16.h"
+#include "traffic_p16_deployment_config.h"
 
 #include <assert.h>
 #include <math.h>
@@ -39,5 +40,14 @@ int main(void)
     assert(traffic_p16_prepare_packets(packets, TRAFFIC_P16_WINDOW_SIZE, &config,
                                        numeric, ids) == TRAFFIC_P16_OK);
     assert(ids[1] == 0 && numeric[5] == 1.0f);
+    const traffic_p16_config_t *deployed = traffic_p16_default_config();
+    packets[1].source_ipv4 = 0xc0a8010aU;
+    packets[1].destination_ipv4 = 0x14ca327bU;
+    assert(traffic_p16_prepare_packets(packets, TRAFFIC_P16_WINDOW_SIZE, deployed,
+                                       numeric, ids) == TRAFFIC_P16_OK);
+    assert(deployed->vocabulary_count == 141 && deployed->vocabulary_size_including_unk == 142);
+    assert(ids[1] == 47);
+    assert(strcmp(traffic_p16_class_name(3), "Voice") == 0);
+    assert(strcmp(traffic_p16_class_name(4), "VStream") == 0);
     return 0;
 }

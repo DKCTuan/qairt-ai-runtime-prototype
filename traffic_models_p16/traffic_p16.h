@@ -77,6 +77,12 @@ int traffic_p16_predict(const float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS],
                         const int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE],
                         traffic_p16_result_t *result);
 
+/* Convenience operation for an SDK that owns preprocessing. */
+int traffic_p16_predict_packets(const traffic_p16_packet_t *packets,
+                                size_t packet_count,
+                                const traffic_p16_config_t *config,
+                                traffic_p16_result_t *result);
+
 #ifdef __cplusplus
 }
 #endif
