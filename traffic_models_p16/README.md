@@ -43,3 +43,7 @@ make OUT=dist/traffic_p16 \
 The build also produces `app_p16_arm64`, a deterministic smoke client. It
 exercises the full raw-packet preprocessing path and is not a substitute for
 parity validation using a real captured window.
+
+For handoff together with the already-tested RF V6 artifact, use
+`tools/package_combined_musl.sh`. The resulting archive has a `bin/` + `lib/`
+layout and includes `docs/HANDOFF.md`.
