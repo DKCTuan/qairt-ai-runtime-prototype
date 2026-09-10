@@ -11,7 +11,7 @@ Không có `libtraffic_models.so`, `libtraffic_p16.so` hay model TinyGRU cũ tro
 bundle unified này. Random Forest được biên dịch trực tiếp vào
 `libtraffic_ai.so`; chỉ model TinyGRU P16 được giữ thành dependency riêng.
 
-Hai GRU có class order khác nhau. Luôn dùng hàm/tài liệu của đúng SDK để đổi
+RF và P16 có class order khác nhau. Luôn dùng hàm/tài liệu của đúng API để đổi
 label sang tên class:
 
 ```text
@@ -136,5 +136,5 @@ aarch64-openwrt-linux-musl-gcc customer_app.c \
 
 Application chỉ cần `#include "traffic_ai.h"`; header này gom API RF và P16.
 
-`bin/app_p16_arm64` chỉ là smoke test P16, không thay thế test bằng capture
-thật hoặc app khách hàng.
+`bin/app_traffic_ai_arm64` chỉ là smoke test P16, không thay thế test bằng
+capture thật hoặc app khách hàng.

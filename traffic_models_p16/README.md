@@ -1,7 +1,9 @@
-# TinyGRU P16 integration (separate from V6)
+# Unified Random Forest + TinyGRU P16 SDK
 
-This directory is intentionally separate from `traffic_models/`: the V6 SDK
-uses a one-input TinyGRU and must not be linked with this two-input model.
+This directory produces the current unified SDK: Random Forest is compiled
+directly into `libtraffic_ai.so`, while TinyGRU P16 remains its own model
+library (`libtiny_gru_p16_float32.so`). The legacy one-input TinyGRU is not
+part of this build.
 
 `traffic_p16_prepare_packets()` receives the 90 post-skip packets and creates
 both TFLite tensors itself. Every record must contain a microsecond timestamp,
@@ -30,20 +32,20 @@ python3 tools/generate_p16_deployment_config.py \
 The model ABI is verified at initialization. It accepts only TFLite input 0
 `float32 [1,90,3]`, input 1 `int32 [1,90]`, and output `float32 [1,5]`.
 
-To build the P16 wrapper alongside its generated model library:
+To build the unified SDK alongside its generated P16 model library:
 
 ```bash
-make OUT=dist/traffic_p16 \
+make OUT=dist/traffic_ai \
   GRU_LIBRARY=dist/tiny_gru_p16/arm64/libtiny_gru_p16_float32.so \
   GRU_INCLUDE=dist/tiny_gru_p16/arm64 \
   CC=aarch64-openwrt-linux-musl-gcc \
   STRIP=aarch64-openwrt-linux-musl-strip
 ```
 
-The build also produces `app_p16_arm64`, a deterministic smoke client. It
+The build produces `app_traffic_ai_arm64`, a deterministic smoke client. It
 exercises the full raw-packet preprocessing path and is not a substitute for
 parity validation using a real captured window.
 
-For handoff together with the already-tested RF V6 artifact, use
+For handoff, use
 `tools/package_combined_musl.sh`. The resulting archive has a `bin/` + `lib/`
 layout and includes `docs/HANDOFF.md`.

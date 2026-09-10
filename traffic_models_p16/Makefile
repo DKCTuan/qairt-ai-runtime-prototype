@@ -12,7 +12,7 @@ APP_GRU_LINK = -Wl,-rpath-link,$(dir $(GRU_LIBRARY))
 endif
 
 .PHONY: all combined test
-all: $(OUT)/libtraffic_p16.so $(OUT)/app_p16_arm64
+all: combined
 
 # A single public SDK for the current production pair: Random Forest + the
 # two-input TinyGRU P16.  The old one-input GRU is intentionally not linked.
@@ -21,20 +21,6 @@ combined: $(OUT)/libtraffic_ai.so $(OUT)/app_traffic_ai_arm64
 
 $(OUT):
 	mkdir -p $(OUT)
-
-$(OUT)/libtraffic_p16.so: traffic_p16.c traffic_p16.h \
-	generated/traffic_p16_deployment_config.c generated/traffic_p16_deployment_config.h \
-	exports.map Makefile $(GRU_LIBRARY) | $(OUT)
-	$(CC) $(CFLAGS) $(GRU_FLAGS) -fPIC -shared traffic_p16.c \
-		generated/traffic_p16_deployment_config.c $(GRU_LINK) -lm \
-		-Wl,--gc-sections -Wl,--version-script=exports.map \
-		-Wl,-soname,libtraffic_p16.so -o $@
-	$(STRIP) --strip-unneeded $@
-
-$(OUT)/app_p16_arm64: examples/p16_smoke.c traffic_p16.h generated/traffic_p16_deployment_config.h Makefile $(OUT)/libtraffic_p16.so
-	$(CC) $(CFLAGS) examples/p16_smoke.c -L$(OUT) -ltraffic_p16 $(APP_GRU_LINK) \
-		-Wl,-rpath,'$$ORIGIN:$$ORIGIN/../lib' -o $@
-	$(STRIP) --strip-unneeded $@
 
 $(OUT)/libtraffic_ai.so: traffic_p16.c traffic_p16.h \
 	generated/traffic_p16_deployment_config.c generated/traffic_p16_deployment_config.h \
