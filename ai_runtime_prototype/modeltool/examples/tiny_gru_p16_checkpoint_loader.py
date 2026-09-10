@@ -6,13 +6,20 @@ head is intentionally omitted from the inference graph.
 """
 
 
-def load_model(checkpoint_path: str):
+def load_model(checkpoint_path: str, *, trust_pickle: bool = False):
     import torch
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    except Exception as error:
+        if not trust_pickle:
+            raise ValueError(
+                "checkpoint cannot be loaded with weights_only=True; pass "
+                "--trust-pytorch-pickle only when the checkpoint is trusted"
+            ) from error
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
     if not isinstance(checkpoint, dict):
         raise ValueError("checkpoint must be a dictionary")
     state = checkpoint.get("model_state_dict", checkpoint.get("state_dict"))

@@ -10,6 +10,7 @@ guessing an architecture or preprocessing contract.
 
 import argparse
 import importlib.util
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -192,7 +193,16 @@ def _load_external_model(torch, model_path: Path, loader_path: Path, trust_pickl
     load_function = getattr(module, "load_model", None)
     if callable(load_function):
         try:
-            model = load_function(str(model_path))
+            signature = inspect.signature(load_function)
+            accepts_trust = (
+                "trust_pickle" in signature.parameters
+                or any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+                       for parameter in signature.parameters.values())
+            )
+            if accepts_trust:
+                model = load_function(str(model_path), trust_pickle=trust_pickle)
+            else:
+                model = load_function(str(model_path))
         except Exception as error:
             fail(f"MODEL_LOADER_FAILED: load_model() failed: {error}")
         if not isinstance(model, torch.nn.Module):
@@ -343,7 +353,27 @@ def main() -> None:
         validation_input = "synthetic_zeros"
     with torch.no_grad():
         reference_values = tensor_outputs(model(*samples))
-        edge_model = litert_torch.convert(model, tuple(samples))
+        conversion_model = model
+        if detected_format == "torchscript":
+            try:
+                from torch._export.converter import TS2EPConverter
+            except ImportError:
+                fail("TORCHSCRIPT_EXPORT_UNSUPPORTED: this PyTorch version cannot "
+                     "convert ScriptModule to ExportedProgram; use a trusted checkpoint "
+                     "with --model-loader instead")
+            try:
+                # LiteRT-Torch's public convert() API expects an nn.Module and
+                # sample arguments.  Convert TorchScript to an exported graph,
+                # then recover its executable GraphModule so LiteRT does not
+                # attempt to export the ScriptModule directly.
+                exported_program = TS2EPConverter(
+                    model, tuple(samples), sample_kwargs=None
+                ).convert()
+                conversion_model = exported_program.module()
+            except Exception as error:
+                fail(f"TORCHSCRIPT_EXPORT_FAILED: cannot convert ScriptModule to "
+                     f"ExportedProgram: {error}")
+        edge_model = litert_torch.convert(conversion_model, tuple(samples))
         converted_values = tensor_outputs(edge_model(*samples))
     if len(reference_values) != len(converted_values):
         fail("PyTorch and LiteRT output counts differ")
