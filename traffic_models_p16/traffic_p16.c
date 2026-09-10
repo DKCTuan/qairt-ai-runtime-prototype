@@ -1,12 +1,9 @@
 #include "traffic_p16.h"
+#include "model_runtime.h"
+#include "traffic_model_profile.h"
 
 #include <math.h>
 #include <string.h>
-
-#ifdef TRAFFIC_P16_WITH_GRU
-#include "ai_model.h"
-static int p16_ready;
-#endif
 
 static int in_range(uint32_t ip, uint32_t network, unsigned int prefix_bits)
 {
@@ -154,32 +151,27 @@ int traffic_p16_prepare_directional_packets(
 
 int traffic_p16_model_init(void)
 {
-#ifdef TRAFFIC_P16_WITH_GRU
-    int inputs = 0, outputs = 0;
-    dl_tensor_info_t numeric, p16, scores;
-    if (p16_ready) return TRAFFIC_P16_OK;
-    if (ai_model_init() != 0 || ai_model_get_tensor_count(&inputs, &outputs) != 0 ||
-        inputs != 2 || outputs != 1 || ai_model_get_input_info(0, &numeric) != 0 ||
-        ai_model_get_input_info(1, &p16) != 0 || ai_model_get_output_info(0, &scores) != 0 ||
-        numeric.dtype != DL_DTYPE_FLOAT32 || numeric.element_count != TRAFFIC_P16_NUMERIC_ELEMENTS ||
-        p16.dtype != DL_DTYPE_INT32 || p16.element_count != TRAFFIC_P16_WINDOW_SIZE ||
-        scores.dtype != DL_DTYPE_FLOAT32 || scores.element_count != TRAFFIC_P16_CLASS_COUNT) {
-        ai_model_deinit();
+    const traffic_model_contract_t *contract = &traffic_model_profile_contract;
+    if (strcmp(contract->preprocessing_id, "tinygru_p16_v1") != 0 ||
+        contract->input_count != 2 || contract->output_count != 1 ||
+        contract->inputs[0].dtype != TRAFFIC_MODEL_DTYPE_FLOAT32 ||
+        contract->inputs[0].element_count != TRAFFIC_P16_NUMERIC_ELEMENTS ||
+        contract->inputs[1].dtype != TRAFFIC_MODEL_DTYPE_INT32 ||
+        contract->inputs[1].element_count != TRAFFIC_P16_WINDOW_SIZE ||
+        contract->outputs[0].dtype != TRAFFIC_MODEL_DTYPE_FLOAT32 ||
+        contract->outputs[0].element_count != TRAFFIC_P16_CLASS_COUNT ||
+        contract->class_count != TRAFFIC_P16_CLASS_COUNT)
         return TRAFFIC_P16_INFERENCE_ERROR;
-    }
-    p16_ready = 1;
-    return TRAFFIC_P16_OK;
-#else
-    return TRAFFIC_P16_MODEL_UNAVAILABLE;
-#endif
+    int status = traffic_model_runtime_init(contract);
+    if (status == TRAFFIC_MODEL_RUNTIME_OK) return TRAFFIC_P16_OK;
+    if (status == TRAFFIC_MODEL_RUNTIME_UNAVAILABLE)
+        return TRAFFIC_P16_MODEL_UNAVAILABLE;
+    return TRAFFIC_P16_INFERENCE_ERROR;
 }
 
 void traffic_p16_model_deinit(void)
 {
-#ifdef TRAFFIC_P16_WITH_GRU
-    if (p16_ready) ai_model_deinit();
-    p16_ready = 0;
-#endif
+    traffic_model_runtime_deinit();
 }
 
 int traffic_p16_predict(const float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS],
@@ -191,22 +183,21 @@ int traffic_p16_predict(const float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS],
     result->label = -1;
     for (size_t i = 0; i < TRAFFIC_P16_NUMERIC_ELEMENTS; ++i)
         if (!isfinite(numeric[i])) return TRAFFIC_P16_INVALID_INPUT;
-#ifdef TRAFFIC_P16_WITH_GRU
-    if (!p16_ready) return TRAFFIC_P16_MODEL_UNAVAILABLE;
-    dl_tensor_t inputs[2] = {
+    traffic_model_buffer_t inputs[2] = {
         {(void *)numeric, sizeof(float) * TRAFFIC_P16_NUMERIC_ELEMENTS},
         {(void *)p16_ids, sizeof(int32_t) * TRAFFIC_P16_WINDOW_SIZE},
     };
-    dl_tensor_t outputs[1] = {{result->scores, sizeof(result->scores)}};
-    if (ai_model_predict_tensors(inputs, 2, outputs, 1, &result->latency_ms) != 0)
+    traffic_model_buffer_t outputs[1] = {{result->scores, sizeof(result->scores)}};
+    int status = traffic_model_runtime_predict(inputs, 2, outputs, 1,
+                                               &result->latency_ms);
+    if (status == TRAFFIC_MODEL_RUNTIME_UNAVAILABLE)
+        return TRAFFIC_P16_MODEL_UNAVAILABLE;
+    if (status != TRAFFIC_MODEL_RUNTIME_OK)
         return TRAFFIC_P16_INFERENCE_ERROR;
     result->label = 0;
     for (int i = 1; i < TRAFFIC_P16_CLASS_COUNT; ++i)
         if (result->scores[i] > result->scores[result->label]) result->label = i;
     return TRAFFIC_P16_OK;
-#else
-    return TRAFFIC_P16_MODEL_UNAVAILABLE;
-#endif
 }
 
 int traffic_p16_predict_packets(const traffic_p16_packet_t *packets,
@@ -232,4 +223,11 @@ int traffic_p16_predict_directional_packets(
         packets, packet_count, remote_global_ipv4, config, numeric, p16_ids);
     if (status != TRAFFIC_P16_OK) return status;
     return traffic_p16_predict(numeric, p16_ids, result);
+}
+
+const char *traffic_p16_class_name(int label)
+{
+    const traffic_model_contract_t *contract = &traffic_model_profile_contract;
+    return label >= 0 && (size_t)label < contract->class_count ?
+           contract->class_names[label] : "Unknown";
 }

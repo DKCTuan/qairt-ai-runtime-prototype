@@ -1,5 +1,4 @@
-#include "traffic_p16.h"
-#include "traffic_p16_deployment_config.h"
+#include "traffic_ai.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -25,7 +24,8 @@ int main(void)
         fprintf(stderr, "traffic_p16_predict_packets failed: %d\n", status);
         return 1;
     }
-    printf("model=TinyGRU_P16\nlabel=%d\nclass=%s\nscores=", result.label,
+    printf("model=%s\npreprocessing=%s\nlabel=%d\nclass=%s\nscores=",
+           traffic_ai_model_id(), traffic_ai_preprocessing_id(), result.label,
            traffic_p16_class_name(result.label));
     for (int i = 0; i < TRAFFIC_P16_CLASS_COUNT; ++i)
         printf("%s%.8g", i == 0 ? "" : ",", result.scores[i]);

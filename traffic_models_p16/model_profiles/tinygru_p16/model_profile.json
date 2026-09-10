@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "model_id": "tinygru-p16-v1",
+  "preprocessing": "tinygru_p16_v1",
+  "inputs": [
+    {
+      "name": "numeric",
+      "dtype": "float32",
+      "shape": [1, 90, 3]
+    },
+    {
+      "name": "p16_ids",
+      "dtype": "int32",
+      "shape": [1, 90]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "scores",
+      "dtype": "float32",
+      "shape": [1, 5]
+    }
+  ],
+  "classes": [
+    "Background",
+    "Game",
+    "RTVideo",
+    "Voice",
+    "VStream"
+  ]
+}

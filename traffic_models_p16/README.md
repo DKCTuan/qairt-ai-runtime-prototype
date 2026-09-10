@@ -5,6 +5,12 @@ directly into `libtraffic_ai.so`, while TinyGRU P16 remains its own model
 library (`libtiny_gru_p16_float32.so`). The legacy one-input TinyGRU is not
 part of this build.
 
+The SDK now separates a stable multi-tensor runtime from a build-selected
+model profile. The current production profile is
+`model_profiles/tinygru_p16/model_profile.json`; future compatible model
+releases are selected through `MODEL_PROFILE` and `MODEL_LIBRARY`, without a
+model-specific Git branch. See `model_profiles/README.md`.
+
 `traffic_p16_prepare_packets()` receives the 90 post-skip packets and creates
 both TFLite tensors itself. Every record must contain a microsecond timestamp,
 the training-aligned `Length` value, source IPv4 and destination IPv4. A
@@ -26,7 +32,7 @@ python3 tools/generate_p16_deployment_config.py \
   --metadata model_metadata.json \
   --normalization normalization.csv \
   --vocabulary p16_vocabulary.csv \
-  --output-dir generated
+  --output-dir model_profiles/tinygru_p16
 ```
 
 The model ABI is verified at initialization. It accepts only TFLite input 0
@@ -36,8 +42,9 @@ To build the unified SDK alongside its generated P16 model library:
 
 ```bash
 make OUT=dist/traffic_ai \
-  GRU_LIBRARY=dist/tiny_gru_p16/arm64/libtiny_gru_p16_float32.so \
-  GRU_INCLUDE=dist/tiny_gru_p16/arm64 \
+  MODEL_PROFILE=model_profiles/tinygru_p16/model_profile.json \
+  MODEL_LIBRARY=dist/tiny_gru_p16/arm64/libtiny_gru_p16_float32.so \
+  MODEL_INCLUDE=dist/tiny_gru_p16/arm64 \
   CC=aarch64-openwrt-linux-musl-gcc \
   STRIP=aarch64-openwrt-linux-musl-strip
 ```

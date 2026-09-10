@@ -151,9 +151,4 @@ static const traffic_p16_config_t config = {
     vocabulary, sizeof(vocabulary) / sizeof(vocabulary[0]), 142
 };
 
-static const char *const class_names[] = {"Background", "Game", "RTVideo", "Voice", "VStream"};
-
 const traffic_p16_config_t *traffic_p16_default_config(void) { return &config; }
-const char *traffic_p16_class_name(int label) {
-    return label >= 0 && label < TRAFFIC_P16_CLASS_COUNT ? class_names[label] : "Unknown";
-}

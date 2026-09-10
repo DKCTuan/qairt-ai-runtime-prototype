@@ -7,6 +7,11 @@
 | `libtraffic_ai.so` | **SDK công khai duy nhất:** Random Forest và API TinyGRU P16 |
 | `libtiny_gru_p16_float32.so` | Model TinyGRU P16 hai input |
 
+`docs/model_profile.json` ghi lại chính xác model ID, preprocessing adapter,
+thứ tự/shape/dtype tensor và class order của bundle. Ứng dụng cũng có thể ghi
+log `traffic_ai_model_id()` và `traffic_ai_preprocessing_id()` để xác nhận
+đang nạp đúng release.
+
 Không có `libtraffic_models.so`, `libtraffic_p16.so` hay model TinyGRU cũ trong
 bundle unified này. Random Forest được biên dịch trực tiếp vào
 `libtraffic_ai.so`; chỉ model TinyGRU P16 được giữ thành dependency riêng.
@@ -151,6 +156,13 @@ aarch64-openwrt-linux-musl-gcc customer_app.c \
 ```
 
 Application chỉ cần `#include "traffic_ai.h"`; header này gom API RF và P16.
+
+Có thể xác nhận profile đã link trước khi chạy traffic thật:
+
+```c
+printf("model=%s preprocessing=%s\n",
+       traffic_ai_model_id(), traffic_ai_preprocessing_id());
+```
 
 `bin/app_arm64` chỉ là smoke test P16, không thay thế test bằng
 capture thật hoặc app khách hàng.
