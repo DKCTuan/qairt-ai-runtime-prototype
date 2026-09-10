@@ -35,6 +35,59 @@ def executable(value: str | None) -> Path | None:
     return Path(value).expanduser() if value else None
 
 
+def normalize_reference_inputs(values: list[str] | None) -> list[str]:
+    result = []
+    for value in values or []:
+        if "=" in value:
+            name, candidate = value.split("=", 1)
+            if name and candidate:
+                result.append(f"{name}={Path(candidate).expanduser().resolve()}")
+                continue
+        result.append(str(Path(value).expanduser().resolve()))
+    return result
+
+
+def reference_path(value: str) -> Path:
+    candidate = value.split("=", 1)[1] if "=" in value else value
+    return Path(candidate)
+
+
+def load_model_profile(value: str | None) -> tuple[Path, dict] | None:
+    if not value:
+        return None
+    profile_path = path(value)
+    if not profile_path.is_file():
+        raise ModelToolError("MODEL_PROFILE_INVALID", f"model profile not found: {profile_path}")
+    try:
+        profile = read_json(profile_path)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ModelToolError("MODEL_PROFILE_INVALID", f"cannot read {profile_path}: {error}")
+    if profile.get("schema_version") != 1:
+        raise ModelToolError("MODEL_PROFILE_INVALID", "model profile schema_version must be 1")
+    return profile_path, profile
+
+
+def validate_tflite_profile(io: dict, profile: dict) -> None:
+    for group in ("inputs", "outputs"):
+        expected, actual = profile.get(group), io.get(group)
+        if not isinstance(expected, list) or len(expected) != len(actual or []):
+            raise ModelToolError(
+                "MODEL_PROFILE_MISMATCH",
+                f"TFLite {group} count differs from model profile",
+            )
+        for index, (wanted, found) in enumerate(zip(expected, actual)):
+            if not isinstance(wanted, dict) or not isinstance(found, dict):
+                raise ModelToolError("MODEL_PROFILE_INVALID",
+                                     f"{group}[{index}] must be an object")
+            if wanted.get("shape") != found.get("shape") or wanted.get("dtype") != found.get("dtype"):
+                raise ModelToolError(
+                    "MODEL_PROFILE_MISMATCH",
+                    f"TFLite {group}[{index}] differs from model profile: "
+                    f"expected dtype={wanted.get('dtype')} shape={wanted.get('shape')}, "
+                    f"got dtype={found.get('dtype')} shape={found.get('shape')}",
+                )
+
+
 def source_manifest(source: Path, kind: str) -> dict:
     return {
         "name": source.stem,
@@ -62,13 +115,21 @@ def apply_tflite_contract(manifest: dict, io: dict) -> None:
 
 def inspect_source(args, source: Path, kind: str, log_dir: Path) -> dict:
     manifest = source_manifest(source, kind)
+    loaded_profile = load_model_profile(args.model_profile)
+    if loaded_profile:
+        profile_path, profile = loaded_profile
+        manifest["model_profile"] = str(profile_path)
+        manifest["deployment_profile"] = profile
     if kind == "onnx":
         onnx = inspect_onnx(source, python=executable(args.onnx_python),
                             output=log_dir / "onnx_inspect.log")
         manifest["source_io"] = onnx
     elif kind == "tflite":
-        apply_tflite_contract(manifest, inspect_tflite(
-            source, python=executable(args.tflite_python), log_path=log_dir / "tflite_inspect.log"))
+        io = inspect_tflite(source, python=executable(args.tflite_python),
+                            log_path=log_dir / "tflite_inspect.log")
+        if loaded_profile:
+            validate_tflite_profile(io, loaded_profile[1])
+        apply_tflite_contract(manifest, io)
     else:
         # Loading arbitrary pickle data merely to inspect it is unsafe.  The
         # trusted load happens only during conversion with an explicit flag.
@@ -94,10 +155,12 @@ def convert_source(args, source: Path, kind: str, tflite: Path, work: Path) -> t
             "reason": "input was already TFLite; no source-framework parity exists",
         }
     if kind == "pytorch":
+        references = normalize_reference_inputs(args.reference_input)
         report = convert_pytorch(
             source, tflite,
             torch_python=executable(args.torch_python), metadata=path(args.metadata),
-            input_shape=args.input_shape, reference_input=path(args.reference_input),
+            input_shape=args.input_shape, reference_inputs=references,
+            model_profile=path(args.model_profile),
             model_loader=path(args.model_loader),
             trust_pickle=args.trust_pytorch_pickle,
         )
@@ -120,13 +183,15 @@ def convert_source(args, source: Path, kind: str, tflite: Path, work: Path) -> t
         source, tflite, converter=executable(args.onnx2tf),
         input_shapes=args.onnx_input_shape or [], log_path=work / "onnx2tf.log",
     )
-    reference = path(args.reference_input)
-    if not reference:
+    references = normalize_reference_inputs(args.reference_input)
+    if not references:
         raise ModelToolError("REFERENCE_INPUT_REQUIRED",
-                             "ONNX conversion requires --reference-input INPUT.npy for parity validation")
+                             "ONNX conversion requires one --reference-input per model input")
     validation = validate_onnx_tflite(
-        source, tflite, reference, python=executable(args.onnx_python),
+        source, tflite, references, python=executable(args.onnx_python),
         output=work / "onnx_tflite_validation.log",
+        reference_names=[item["name"] for item in load_model_profile(args.model_profile)[1]["inputs"]]
+        if args.model_profile else None,
     )
     return conversion, validation
 
@@ -156,9 +221,13 @@ def cmd_convert(args) -> None:
     conversion, validation = convert_source(args, source, kind, output, output.parent)
     manifest = inspect_source(args, source, kind, output.parent)
     manifest["tflite_model"] = str(output)
-    apply_tflite_contract(manifest, inspect_tflite(
+    io = inspect_tflite(
         output, python=executable(args.tflite_python),
-        log_path=output.with_suffix(".inspect.log")))
+        log_path=output.with_suffix(".inspect.log"))
+    loaded_profile = load_model_profile(args.model_profile)
+    if loaded_profile:
+        validate_tflite_profile(io, loaded_profile[1])
+    apply_tflite_contract(manifest, io)
     manifest["conversion"] = conversion
     write_json(output.with_suffix(output.suffix + ".manifest.json"), manifest)
     write_json(output.with_suffix(output.suffix + ".validation_report.json"), validation)
@@ -173,11 +242,15 @@ def cmd_validate(args) -> None:
     kind = detect_model_type(source)
     report_path = path(args.output)
     if kind == "onnx":
-        reference = path(args.reference_input)
-        if not reference:
-            raise ModelToolError("REFERENCE_INPUT_REQUIRED", "ONNX validation requires --reference-input INPUT.npy")
-        report = validate_onnx_tflite(source, tflite, reference,
-                                      python=executable(args.onnx_python), output=report_path)
+        references = normalize_reference_inputs(args.reference_input)
+        if not references:
+            raise ModelToolError("REFERENCE_INPUT_REQUIRED", "ONNX validation requires reference inputs")
+        loaded_profile = load_model_profile(args.model_profile)
+        report = validate_onnx_tflite(
+            source, tflite, references, python=executable(args.onnx_python), output=report_path,
+            reference_names=[item["name"] for item in loaded_profile[1]["inputs"]]
+            if loaded_profile else None,
+        )
     elif kind == "pytorch":
         raise ModelToolError(
             "PYTORCH_RECONVERT_REQUIRED",
@@ -210,19 +283,26 @@ def cmd_build(args) -> None:
         if not metadata.is_file():
             raise ModelToolError("METADATA_INVALID", f"metadata not found: {metadata}")
         shutil.copy2(metadata, source_dir / metadata.name)
-    reference = path(args.reference_input)
-    if reference:
+    references = normalize_reference_inputs(args.reference_input)
+    for index, reference_value in enumerate(references):
+        reference = reference_path(reference_value)
         if not reference.is_file():
             raise ModelToolError("REFERENCE_INPUT_REQUIRED", f"reference input not found: {reference}")
-        shutil.copy2(reference, reference_dir / reference.name)
+        shutil.copy2(reference, reference_dir / f"{index}_{reference.name}")
+    loaded_profile = load_model_profile(args.model_profile)
+    if loaded_profile:
+        shutil.copy2(loaded_profile[0], source_dir / "model_profile.json")
 
     tflite = converted_dir / "model_float32.tflite"
     conversion, validation = convert_source(args, source, kind, tflite, converted_dir)
     manifest = inspect_source(args, source, kind, root)
     manifest.update({"tflite_model": str(tflite), "conversion": conversion, "target": "arm64"})
-    apply_tflite_contract(manifest, inspect_tflite(
+    io = inspect_tflite(
         tflite, python=executable(args.tflite_python),
-        log_path=converted_dir / "tflite_inspect.log"))
+        log_path=converted_dir / "tflite_inspect.log")
+    if loaded_profile:
+        validate_tflite_profile(io, loaded_profile[1])
+    apply_tflite_contract(manifest, io)
     write_json(root / "validation_report.json", validation)
     write_json(root / "manifest.json", manifest)
 
@@ -245,11 +325,13 @@ def cmd_build(args) -> None:
 
 def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--metadata", help="Preprocessing metadata JSON, if available")
-    parser.add_argument("--reference-input", help="Reference input tensor in .npy format")
+    parser.add_argument("--model-profile", help="Deployment model_profile.json contract")
+    parser.add_argument("--reference-input", action="append", default=[],
+                        help="Repeatable [TENSOR_NAME=]FILE.npy reference tensor")
     parser.add_argument("--input-shape", help="Fallback model input shape, e.g. 1,90,3")
     parser.add_argument("--torch-python", default=str(Path.home() / "venvs/model-torch/bin/python"))
     parser.add_argument("--onnx-python", default=str(Path.home() / "venvs/model-onnx/bin/python"))
-    parser.add_argument("--tflite-python", default=str(Path.home() / "venvs/model-onnx/bin/python"))
+    parser.add_argument("--tflite-python", default=str(Path.home() / "venvs/tf215/bin/python"))
     parser.add_argument("--onnx2tf", default=str(Path.home() / "venvs/model-onnx/bin/onnx2tf"))
     parser.add_argument("--onnx-input-shape", action="append",
                         help="onnx2tf static input override; repeat for multiple inputs")

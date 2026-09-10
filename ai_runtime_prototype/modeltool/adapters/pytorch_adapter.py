@@ -8,7 +8,8 @@ from ..core.process import run
 
 def convert_pytorch(source: Path, output: Path, *, torch_python: Path,
                     metadata: Path | None, input_shape: str | None,
-                    reference_input: Path | None, model_loader: Path | None,
+                    reference_inputs: list[str], model_profile: Path | None,
+                    model_loader: Path | None,
                     trust_pickle: bool) -> dict:
     """Use the maintained TinyGRU/TorchScript exporter in model-torch venv."""
     if not torch_python.is_file():
@@ -21,8 +22,10 @@ def convert_pytorch(source: Path, output: Path, *, torch_python: Path,
         command.extend(["--metadata", str(metadata)])
     if input_shape:
         command.extend(["--input-shape", input_shape])
-    if reference_input:
-        command.extend(["--reference-input", str(reference_input)])
+    for reference_input in reference_inputs:
+        command.extend(["--reference-input", reference_input])
+    if model_profile:
+        command.extend(["--model-profile", str(model_profile)])
     if model_loader:
         command.extend(["--model-loader", str(model_loader)])
     if trust_pickle:

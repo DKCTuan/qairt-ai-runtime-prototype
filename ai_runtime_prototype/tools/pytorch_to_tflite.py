@@ -59,6 +59,71 @@ def shape_from_metadata(metadata_path: Path | None) -> tuple[int, ...] | None:
         fail(f"invalid JSON metadata: {metadata_path}")
 
 
+def load_profile(path_value: str | None):
+    if not path_value:
+        return None
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_file():
+        fail(f"model profile not found: {path}")
+    try:
+        profile = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"invalid model profile: {error}")
+    inputs = profile.get("inputs")
+    if profile.get("schema_version") != 1 or not isinstance(inputs, list) or not inputs:
+        fail("model profile must use schema_version=1 and declare inputs")
+    result = []
+    supported = {"float32", "int32"}
+    for index, item in enumerate(inputs):
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            fail(f"model profile input {index} has no valid name")
+        dtype, shape = item.get("dtype"), item.get("shape")
+        if dtype not in supported:
+            fail(f"unsupported profile dtype {dtype!r}; supported: {sorted(supported)}")
+        if not isinstance(shape, list) or not shape or not all(
+                isinstance(value, int) and value > 0 for value in shape):
+            fail(f"model profile input {item['name']!r} has invalid static shape")
+        result.append({"name": item["name"], "dtype": dtype, "shape": tuple(shape)})
+    return path, profile, result
+
+
+def reference_paths(arguments: list[str], input_specs: list[dict]) -> list[Path] | None:
+    if not arguments:
+        return None
+    named, positional = {}, []
+    valid_names = {item["name"] for item in input_specs}
+    for argument in arguments:
+        if "=" in argument and argument.split("=", 1)[0] in valid_names:
+            name, value = argument.split("=", 1)
+            if name in named or not value:
+                fail(f"duplicate or invalid named --reference-input: {argument}")
+            named[name] = value
+        else:
+            positional.append(argument)
+    if named and positional:
+        fail("do not mix named and positional --reference-input values")
+    if named:
+        if set(named) != valid_names:
+            fail("reference input names differ from model profile: expected=" +
+                 str(sorted(valid_names)) + " got=" + str(sorted(named)))
+        values = [named[item["name"]] for item in input_specs]
+    else:
+        if len(positional) != len(input_specs):
+            fail(f"expected {len(input_specs)} reference inputs, got {len(positional)}")
+        values = positional
+    paths = [Path(value).expanduser().resolve() for value in values]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        fail("reference input not found: " + ", ".join(missing))
+    return paths
+
+
+def tensor_outputs(value):
+    if isinstance(value, (tuple, list)):
+        return list(value)
+    return [value]
+
+
 def build_tiny_gru(torch, config: dict):
     """Rebuild the known TinyGRU inference graph from its saved config."""
     required = ("input_size", "hidden_size", "num_classes")
@@ -220,8 +285,10 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--input-shape", help="For example: 1,90,3. Defaults to metadata input_shape.")
     parser.add_argument("--metadata", help="Optional preprocessing metadata JSON")
-    parser.add_argument("--reference-input",
-                        help="Optional .npy float32 tensor used for source/TFLite parity validation")
+    parser.add_argument("--reference-input", action="append", default=[],
+                        help="Repeatable [NAME=]FILE.npy used for source/TFLite parity validation")
+    parser.add_argument("--model-profile",
+                        help="Deployment model_profile.json defining ordered input shapes/dtypes")
     parser.add_argument("--model-loader",
                         help="Trusted Python loader exposing load_model(path) or build_model()")
     parser.add_argument("--trust-pytorch-pickle", action="store_true")
@@ -239,37 +306,56 @@ def main() -> None:
     if not model_path.is_file():
         fail(f"PyTorch model not found: {model_path}")
     metadata_path = find_metadata(model_path, args.metadata)
-    input_shape = parse_shape(args.input_shape) if args.input_shape else shape_from_metadata(metadata_path)
-    if input_shape is None:
-        fail("input shape is unknown. Provide --input-shape or a metadata JSON containing input_shape.")
+    loaded_profile = load_profile(args.model_profile)
+    if loaded_profile:
+        profile_path, profile, input_specs = loaded_profile
+        if args.input_shape:
+            fail("do not combine --model-profile with --input-shape")
+    else:
+        profile_path, profile = None, None
+        input_shape = parse_shape(args.input_shape) if args.input_shape else shape_from_metadata(metadata_path)
+        if input_shape is None:
+            fail("input shape is unknown. Provide --model-profile, --input-shape, or metadata input_shape.")
+        input_specs = [{"name": "input_0", "dtype": "float32", "shape": input_shape}]
 
     loader_path = Path(args.model_loader).expanduser().resolve() if args.model_loader else None
     model, detected_format = load_model(torch, model_path, args.trust_pytorch_pickle, loader_path)
-    if args.reference_input:
-        reference_input_path = Path(args.reference_input).expanduser().resolve()
-        if not reference_input_path.is_file():
-            fail(f"reference input not found: {reference_input_path}")
-        try:
-            value = np.load(reference_input_path, allow_pickle=False)
-        except (OSError, ValueError) as error:
-            fail(f"cannot load reference input .npy: {error}")
-        if tuple(value.shape) != input_shape:
-            fail("reference input shape does not match model contract: "
-                 f"got {tuple(value.shape)}, expected {input_shape}")
-        if not np.issubdtype(value.dtype, np.number):
-            fail(f"reference input must be numeric, got {value.dtype}")
-        sample = torch.from_numpy(np.asarray(value, dtype=np.float32))
-        validation_input = str(reference_input_path)
+    paths = reference_paths(args.reference_input, input_specs)
+    numpy_dtypes = {"float32": np.float32, "int32": np.int32}
+    torch_dtypes = {"float32": torch.float32, "int32": torch.int32}
+    if paths:
+        samples = []
+        for spec, reference_input_path in zip(input_specs, paths):
+            try:
+                value = np.load(reference_input_path, allow_pickle=False)
+            except (OSError, ValueError) as error:
+                fail(f"cannot load reference input {reference_input_path}: {error}")
+            if tuple(value.shape) != spec["shape"]:
+                fail(f"reference input {spec['name']!r} shape mismatch: "
+                     f"got {tuple(value.shape)}, expected {spec['shape']}")
+            if not np.issubdtype(value.dtype, np.number):
+                fail(f"reference input {spec['name']!r} must be numeric, got {value.dtype}")
+            samples.append(torch.from_numpy(np.asarray(value, dtype=numpy_dtypes[spec["dtype"]])))
+        validation_input = [str(path) for path in paths]
     else:
-        sample = torch.zeros(input_shape, dtype=torch.float32)
+        samples = [torch.zeros(spec["shape"], dtype=torch_dtypes[spec["dtype"]])
+                   for spec in input_specs]
         validation_input = "synthetic_zeros"
     with torch.no_grad():
-        reference = model(sample).detach().cpu().numpy()
-        edge_model = litert_torch.convert(model, (sample,))
-        converted = np.asarray(edge_model(sample))
-    max_abs_error = float(np.max(np.abs(reference - converted)))
-    if not np.allclose(reference, converted, rtol=1e-4, atol=1e-5):
-        fail(f"PyTorch and LiteRT outputs differ: max_abs_error={max_abs_error}")
+        reference_values = tensor_outputs(model(*samples))
+        edge_model = litert_torch.convert(model, tuple(samples))
+        converted_values = tensor_outputs(edge_model(*samples))
+    if len(reference_values) != len(converted_values):
+        fail("PyTorch and LiteRT output counts differ")
+    reference_arrays = [value.detach().cpu().numpy() if hasattr(value, "detach")
+                        else np.asarray(value) for value in reference_values]
+    converted_arrays = [value.detach().cpu().numpy() if hasattr(value, "detach")
+                        else np.asarray(value) for value in converted_values]
+    errors = [float(np.max(np.abs(reference - converted)))
+              for reference, converted in zip(reference_arrays, converted_arrays)]
+    if not all(np.allclose(reference, converted, rtol=1e-4, atol=1e-5)
+               for reference, converted in zip(reference_arrays, converted_arrays)):
+        fail(f"PyTorch and LiteRT outputs differ: max_abs_errors={errors}")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     edge_model.export(str(output))
@@ -278,11 +364,15 @@ def main() -> None:
         "source_model": str(model_path),
         "source_format": detected_format,
         "tflite_model": str(output),
-        "input_shape": list(input_shape),
+        "inputs": [{"name": spec["name"], "shape": list(spec["shape"]),
+                    "dtype": spec["dtype"]} for spec in input_specs],
+        "input_shape": list(input_specs[0]["shape"]) if len(input_specs) == 1 else None,
         "metadata": str(metadata_path) if metadata_path else None,
+        "model_profile": str(profile_path) if profile_path else None,
         "model_loader": str(loader_path) if loader_path else None,
         "validation_input": validation_input,
-        "max_abs_error": max_abs_error,
+        "max_abs_error": max(errors),
+        "max_abs_errors": errors,
     }
     output.with_suffix(output.suffix + ".export.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8")

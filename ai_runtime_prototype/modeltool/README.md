@@ -3,6 +3,7 @@
 `modeltool.py` is the framework-aware front end.  It keeps conversion,
 validation and deployment records together, while reusing
 `tools/model_deploy.py` for the already-tested TensorFlow Lite ARM64 linker.
+It supports one-input models and profile-described multi-input models.
 
 ## Commands
 
@@ -150,12 +151,37 @@ Then build with the same command and add:
 The loader is only used on the development host to reconstruct the model.  It
 is not included in the target artifact.  Treat it as trusted Python code.
 
+## Multi-input conversion
+
+Use a deployment profile to define tensor order, dtype and shape, then provide
+one real reference tensor per input. Named references remove ambiguity from
+command-line order:
+
+```bash
+python3 ai_runtime_prototype/modeltool/modeltool.py convert model.pt \
+  --output model.tflite \
+  --model-profile traffic_models_p16/model_profiles/tinygru_p16/model_profile.json \
+  --reference-input numeric=/path/to/reference_numeric.npy \
+  --reference-input p16_ids=/path/to/reference_p16_ids.npy \
+  --model-loader /path/to/p16_loader.py \
+  --trust-pytorch-pickle \
+  --torch-python /path/to/venvs/model-torch/bin/python \
+  --tflite-python /path/to/venvs/tf215/bin/python
+```
+
+The exporter invokes the source model with ordered positional tensors,
+validates every source/LiteRT output, and rejects the exported TFLite if its
+ordered shape/dtype contract differs from the profile. ONNX uses the same
+repeatable `--reference-input` interface. With a profile, names match the
+profile; without one, they match the ONNX graph inputs.
+
 ## Current limits
 
 - A state_dict-only PyTorch file requires `--model-loader`; model architecture
   and preprocessing cannot be recovered reliably from weights alone.
-- ONNX v1 accepts one input for parity validation.  `onnx2tf` must support all
-  operators in the source graph; the tool saves converter logs on failure.
+- Model profiles currently support `float32` and `int32` inputs.
+- `onnx2tf` must support all operators in the source graph; the tool saves
+  converter logs on failure.
 - Existing TFLite is inspected and packaged directly; there is no separate
   source-framework output to compare.
 - ARM64 packaging is tested with the iGate-compatible GNU toolchain and target

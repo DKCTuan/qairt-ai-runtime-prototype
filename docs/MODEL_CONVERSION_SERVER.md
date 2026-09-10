@@ -31,16 +31,16 @@ before upgrading any package. This repository intentionally does not claim
 that arbitrary latest PyTorch, LiteRT Torch, TensorFlow and ONNX packages are
 compatible.
 
-## One-input PyTorch and ONNX models
+## PyTorch and ONNX models
 
 For a deployable conversion provide the source model, model contract and a
-real preprocessed reference tensor. A state-dict-only `.pt`/`.pth` additionally
+real preprocessed reference tensor for every input. A state-dict-only `.pt`/`.pth` additionally
 needs a trusted loader that reconstructs the architecture.
 
 ```text
 model.pt | model.pth | model.onnx
 preprocessing metadata / class order
-reference_input.npy
+one reference `.npy` per input
 loader.py (state_dict-only PyTorch only)
 ```
 
@@ -49,14 +49,23 @@ validation record alongside the ARM64 library.
 
 ## Multi-input models such as TinyGRU P16
 
-The current generic PyTorch and ONNX adapters validate one source input only.
-They must not be used to convert P16 directly. P16 conversion remains:
+Multi-input conversion uses `model_profile.json` as the ordered ABI contract.
+Pass every real, already-preprocessed reference tensor by name:
 
-```text
-trusted P16 training/notebook export -> tiny_gru_p16_float32.tflite
-                                      -> modeltool build -> ARM64 musl .so
+```bash
+python "$REPO_ROOT/ai_runtime_prototype/modeltool/modeltool.py" convert \
+  /path/to/checkpoint.pt \
+  --output /path/to/model.tflite \
+  --model-profile "$REPO_ROOT/traffic_models_p16/model_profiles/tinygru_p16/model_profile.json" \
+  --reference-input numeric=/path/to/reference_numeric.npy \
+  --reference-input p16_ids=/path/to/reference_p16_ids.npy \
+  --model-loader /path/to/p16_loader.py \
+  --trust-pytorch-pickle \
+  --torch-python "$BUILD_ROOT/venvs/model-torch/bin/python" \
+  --tflite-python "$BUILD_ROOT/venvs/tf215/bin/python"
 ```
 
-The generic TFLite-to-musl build and generated model ABI do support P16's two
-TFLite inputs. Extending source-framework conversion needs a tested two-input
-reference contract (numeric `.npy` plus P16-ID `.npy`) and is a separate task.
+The tool compares every source and converted output and rejects a TFLite whose
+input/output shape or dtype differs from the profile. A state-dict checkpoint
+still needs trusted architecture code in `--model-loader`; tensor metadata
+cannot reconstruct an arbitrary model class.

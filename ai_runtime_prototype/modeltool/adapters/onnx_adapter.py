@@ -62,29 +62,57 @@ def convert_onnx(source: Path, output: Path, *, converter: Path,
     return {"converter": "onnx2tf", "log": str(log_path)}
 
 
-def validate_onnx_tflite(source: Path, tflite: Path, reference_input: Path, *,
-                          python: Path, output: Path) -> dict:
-    """Run one-input ONNX Runtime and TFLite inference on the same .npy tensor."""
-    if not reference_input.is_file():
-        raise ModelToolError("REFERENCE_INPUT_REQUIRED",
-                             f"reference input not found: {reference_input}")
+def validate_onnx_tflite(source: Path, tflite: Path, reference_inputs: list[str], *,
+                          python: Path, output: Path,
+                          reference_names: list[str] | None = None) -> dict:
+    """Run multi-input ONNX Runtime and TFLite inference on identical tensors."""
+    if not reference_inputs:
+        raise ModelToolError("REFERENCE_INPUT_REQUIRED", "at least one reference input is required")
     script = r'''
 import json, sys
 import numpy as np
 import onnxruntime as ort
 import tensorflow as tf
-onnx_path, tflite_path, input_path = sys.argv[1:]
-value = np.load(input_path, allow_pickle=False)
+onnx_path, tflite_path, encoded_inputs, encoded_names = sys.argv[1:]
+arguments = json.loads(encoded_inputs)
+profile_names = json.loads(encoded_names)
 session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-if len(session.get_inputs()) != 1:
-    raise RuntimeError("v1 supports exactly one ONNX input for parity validation")
-source_output = session.run(None, {session.get_inputs()[0].name: value})
+source_inputs = session.get_inputs()
+named, positional = {}, []
+for argument in arguments:
+    if "=" in argument:
+        name, path = argument.split("=", 1)
+        if not name or not path or name in named:
+            raise RuntimeError("invalid or duplicate named reference input: " + argument)
+        named[name] = path
+    else:
+        positional.append(argument)
+if named and positional:
+    raise RuntimeError("do not mix named and positional reference inputs")
+if named:
+    ordered_names = profile_names or [item.name for item in source_inputs]
+    expected = set(ordered_names)
+    if set(named) != expected:
+        raise RuntimeError("reference names differ from input contract: expected=" +
+                           str(sorted(expected)) + " got=" + str(sorted(named)))
+    paths = [named[name] for name in ordered_names]
+else:
+    if len(positional) != len(source_inputs):
+        raise RuntimeError("reference input count differs from ONNX input count")
+    paths = positional
+values = [np.load(path, allow_pickle=False) for path in paths]
+source_output = session.run(None, {item.name: value for item, value in zip(source_inputs, values)})
 interpreter = tf.lite.Interpreter(model_path=tflite_path)
 interpreter.allocate_tensors()
 inputs, outputs = interpreter.get_input_details(), interpreter.get_output_details()
-if len(inputs) != 1 or len(outputs) != len(source_output):
+if len(inputs) != len(values) or len(outputs) != len(source_output):
     raise RuntimeError("TFLite I/O count differs from ONNX output contract")
-interpreter.set_tensor(inputs[0]["index"], value.astype(inputs[0]["dtype"], copy=False))
+for detail, value in zip(inputs, values):
+    expected_shape = tuple(int(x) for x in detail["shape"])
+    if tuple(value.shape) != expected_shape:
+        raise RuntimeError("reference shape differs from TFLite input " + detail["name"] +
+                           ": expected=" + str(expected_shape) + " got=" + str(value.shape))
+    interpreter.set_tensor(detail["index"], value.astype(detail["dtype"], copy=False))
 interpreter.invoke()
 tflite_output = [interpreter.get_tensor(x["index"]) for x in outputs]
 errors = [np.abs(a - b) for a, b in zip(source_output, tflite_output)]
@@ -93,13 +121,14 @@ max_rel = max(float((x / np.maximum(np.abs(a), 1e-12)).max())
               for a, x in zip(source_output, errors))
 passed = all(np.allclose(a, b, rtol=1e-4, atol=1e-5)
              for a, b in zip(source_output, tflite_output))
-print(json.dumps({"status": "PASS" if passed else "FAIL", "input": input_path,
+print(json.dumps({"status": "PASS" if passed else "FAIL", "inputs": paths,
                   "max_abs_error": max_abs, "max_rel_error": max_rel,
                   "rtol": 1e-4, "atol": 1e-5}))
 '''
     import subprocess
     result = subprocess.run([str(python), "-c", script, str(source), str(tflite),
-                             str(reference_input)], text=True, stdout=subprocess.PIPE,
+                             json.dumps(reference_inputs), json.dumps(reference_names or [])],
+                            text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, check=False)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(result.stdout + result.stderr, encoding="utf-8", errors="replace")
