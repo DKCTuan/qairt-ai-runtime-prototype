@@ -62,31 +62,47 @@ packet thô sau khi bỏ 10 packet đầu. Một flow cần tối thiểu 100 pa
 packet gốc 1–10, rồi packet 11–100 trở thành window đầu tiên. Window tiếp theo
 dùng stride 90.
 
-### Input application → SDK
+### Input application → SDK: mode một remote IP cho một window
 
-Application phải truyền đúng mảng `packets[90]` sau:
+Đây là mode dùng cho app của anh Kiên: app truyền 90 bộ
+`timestamp + length + direction` (tương đương 90×3 field) và **một** remote
+global IPv4 dùng chung cho cả window. `timestamp_us` là timestamp tuyệt đối,
+không phải IAT; SDK tự tính IAT từ các timestamp này.
 
 ```c
-traffic_p16_packet_t packets[TRAFFIC_P16_WINDOW_SIZE];
+traffic_p16_directional_packet_t packets[TRAFFIC_P16_WINDOW_SIZE];
 traffic_p16_result_t p16;
+uint32_t remote_global_ipv4 = 0x14ca327bU; /* 20.202.50.123, host-order */
 
 /* Per packet:
  * timestamp_us       : microseconds, non-decreasing within flow
  * packet_length      : same meaning as the training CSV's Length column
- * source_ipv4        : IPv4 host-order
- * destination_ipv4   : IPv4 host-order
+ * direction          : +1 local -> remote; -1 remote -> local
  */
 if (traffic_p16_model_init() != TRAFFIC_P16_OK) {
     /* model/library loading error */
 }
 
-int status = traffic_p16_predict_packets(
+int status = traffic_p16_predict_directional_packets(
     packets, TRAFFIC_P16_WINDOW_SIZE,
+    remote_global_ipv4,
     traffic_p16_default_config(), &p16);
 
 const char *name = traffic_p16_class_name(p16.label);
 traffic_p16_model_deinit();
 ```
+
+`remote_global_ipv4` phải là IPv4 global-unicast ở **host-order** và phải thật
+sự giống nhau cho tất cả 90 packet. SDK lookup `/16` một lần, rồi dùng ID đó
+cho toàn bộ tensor `[1,90]`. Nếu window có nhiều remote IP, không dùng API
+này; dùng API `traffic_p16_predict_packets()` với source/destination IPv4 cho
+từng packet.
+
+### API source/destination (tùy chọn)
+
+API cũ `traffic_p16_predict_packets()` vẫn hỗ trợ khi app muốn truyền
+source/destination IPv4 cho từng packet. SDK sẽ tự suy ra direction và remote
+IP. Không dùng cả hai API cho cùng một window.
 
 ### Hai input thật của `.tflite`
 

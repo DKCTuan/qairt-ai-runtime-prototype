@@ -31,6 +31,15 @@ typedef struct {
     uint32_t destination_ipv4;
 } traffic_p16_packet_t;
 
+/* Use this form when the caller already owns flow direction and all packets
+ * in the 90-packet window have the same global remote endpoint. direction is
+ * +1 for local-to-remote and -1 for remote-to-local. */
+typedef struct {
+    uint64_t timestamp_us;
+    uint32_t packet_length;
+    int8_t direction;
+} traffic_p16_directional_packet_t;
+
 /* prefix16 is the high 16 bits of an IPv4 address, e.g. 20.202.0.0/16 is
  * 0x14ca. Entries must be strictly sorted by prefix16; ID 0 is reserved for
  * unknown or invalid remote endpoints. */
@@ -68,6 +77,15 @@ int traffic_p16_prepare_packets(const traffic_p16_packet_t *packets,
                                 float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS],
                                 int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE]);
 
+/* remote_global_ipv4 is host-order and is applied to every packet in this
+ * window. It must be global-unicast; an unlisted /16 still maps to ID 0
+ * (UNK), matching the trained model contract. */
+int traffic_p16_prepare_directional_packets(
+    const traffic_p16_directional_packet_t *packets, size_t packet_count,
+    uint32_t remote_global_ipv4, const traffic_p16_config_t *config,
+    float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS],
+    int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE]);
+
 /* These functions use the generated model library's multi-tensor ABI.
  * The model must expose exactly float32 [1,90,3], int32 [1,90], and float32
  * [1,5], in that discovered tensor order. */
@@ -82,6 +100,11 @@ int traffic_p16_predict_packets(const traffic_p16_packet_t *packets,
                                 size_t packet_count,
                                 const traffic_p16_config_t *config,
                                 traffic_p16_result_t *result);
+
+int traffic_p16_predict_directional_packets(
+    const traffic_p16_directional_packet_t *packets, size_t packet_count,
+    uint32_t remote_global_ipv4, const traffic_p16_config_t *config,
+    traffic_p16_result_t *result);
 
 #ifdef __cplusplus
 }

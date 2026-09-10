@@ -4,10 +4,12 @@
     traffic_rf_predict;
     traffic_rf_extract;
     traffic_p16_prepare_packets;
+    traffic_p16_prepare_directional_packets;
     traffic_p16_model_init;
     traffic_p16_model_deinit;
     traffic_p16_predict;
     traffic_p16_predict_packets;
+    traffic_p16_predict_directional_packets;
     traffic_p16_default_config;
     traffic_p16_class_name;
   local: *;

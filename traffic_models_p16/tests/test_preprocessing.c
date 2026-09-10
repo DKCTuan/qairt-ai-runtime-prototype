@@ -12,6 +12,7 @@ int main(void)
     traffic_p16_config_t config = {{1.0f, 2.0f, 0.0f}, {2.0f, 4.0f, 1.0f}, vocab, 2, 24};
     float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS];
     int32_t ids[TRAFFIC_P16_WINDOW_SIZE];
+    traffic_p16_directional_packet_t directional[TRAFFIC_P16_WINDOW_SIZE];
     memset(packets, 0, sizeof(packets));
     for (int i = 0; i < TRAFFIC_P16_WINDOW_SIZE; ++i) {
         packets[i].timestamp_us = (uint64_t)i * 2000000U;
@@ -47,6 +48,24 @@ int main(void)
                                        numeric, ids) == TRAFFIC_P16_OK);
     assert(deployed->vocabulary_count == 141 && deployed->vocabulary_size_including_unk == 142);
     assert(ids[1] == 47);
+    for (int i = 0; i < TRAFFIC_P16_WINDOW_SIZE; ++i) {
+        directional[i].timestamp_us = (uint64_t)i * 2000000U;
+        directional[i].packet_length = 99;
+        directional[i].direction = i % 2 ? -1 : 1;
+    }
+    assert(traffic_p16_prepare_directional_packets(
+               directional, TRAFFIC_P16_WINDOW_SIZE, 0x14ca327bU, &config,
+               numeric, ids) == TRAFFIC_P16_OK);
+    assert(ids[0] == 17 && ids[89] == 17);
+    assert(numeric[2] == 1.0f && numeric[5] == -1.0f);
+    directional[1].direction = 0;
+    assert(traffic_p16_prepare_directional_packets(
+               directional, TRAFFIC_P16_WINDOW_SIZE, 0x14ca327bU, &config,
+               numeric, ids) == TRAFFIC_P16_INVALID_INPUT);
+    directional[1].direction = -1;
+    assert(traffic_p16_prepare_directional_packets(
+               directional, TRAFFIC_P16_WINDOW_SIZE, 0x64400001U, &config,
+               numeric, ids) == TRAFFIC_P16_INVALID_INPUT);
     assert(strcmp(traffic_p16_class_name(3), "Voice") == 0);
     assert(strcmp(traffic_p16_class_name(4), "VStream") == 0);
     return 0;

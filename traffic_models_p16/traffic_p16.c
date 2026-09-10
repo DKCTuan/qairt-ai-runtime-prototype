@@ -119,6 +119,39 @@ int traffic_p16_prepare_packets(const traffic_p16_packet_t *packets,
     return TRAFFIC_P16_OK;
 }
 
+int traffic_p16_prepare_directional_packets(
+    const traffic_p16_directional_packet_t *packets, size_t packet_count,
+    uint32_t remote_global_ipv4, const traffic_p16_config_t *config,
+    float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS],
+    int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE])
+{
+    if (packets == NULL || numeric == NULL || p16_ids == NULL ||
+        packet_count != TRAFFIC_P16_WINDOW_SIZE || !valid_config(config) ||
+        !ipv4_global_unicast(remote_global_ipv4))
+        return TRAFFIC_P16_INVALID_INPUT;
+
+    int32_t p16_id = lookup_prefix16(config, (uint16_t)(remote_global_ipv4 >> 16));
+    for (size_t i = 0; i < packet_count; ++i) {
+        float values[TRAFFIC_P16_NUMERIC_CHANNELS];
+        float iat_seconds;
+        if ((i != 0 && packets[i].timestamp_us < packets[i - 1].timestamp_us) ||
+            (packets[i].direction != -1 && packets[i].direction != 1))
+            return TRAFFIC_P16_INVALID_INPUT;
+        iat_seconds = i == 0 ? 0.0f :
+            (float)((packets[i].timestamp_us - packets[i - 1].timestamp_us) / 1000000.0);
+        values[0] = log1pf((float)packets[i].packet_length);
+        values[1] = log1pf(iat_seconds);
+        values[2] = (float)packets[i].direction;
+        for (size_t channel = 0; channel < TRAFFIC_P16_NUMERIC_CHANNELS; ++channel) {
+            float normalized = (values[channel] - config->mean[channel]) / config->std[channel];
+            if (!isfinite(normalized)) return TRAFFIC_P16_INVALID_INPUT;
+            numeric[i * TRAFFIC_P16_NUMERIC_CHANNELS + channel] = normalized;
+        }
+        p16_ids[i] = p16_id;
+    }
+    return TRAFFIC_P16_OK;
+}
+
 int traffic_p16_model_init(void)
 {
 #ifdef TRAFFIC_P16_WITH_GRU
@@ -184,6 +217,19 @@ int traffic_p16_predict_packets(const traffic_p16_packet_t *packets,
     float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS];
     int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE];
     int status = traffic_p16_prepare_packets(packets, packet_count, config, numeric, p16_ids);
+    if (status != TRAFFIC_P16_OK) return status;
+    return traffic_p16_predict(numeric, p16_ids, result);
+}
+
+int traffic_p16_predict_directional_packets(
+    const traffic_p16_directional_packet_t *packets, size_t packet_count,
+    uint32_t remote_global_ipv4, const traffic_p16_config_t *config,
+    traffic_p16_result_t *result)
+{
+    float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS];
+    int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE];
+    int status = traffic_p16_prepare_directional_packets(
+        packets, packet_count, remote_global_ipv4, config, numeric, p16_ids);
     if (status != TRAFFIC_P16_OK) return status;
     return traffic_p16_predict(numeric, p16_ids, result);
 }
