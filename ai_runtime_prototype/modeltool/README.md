@@ -175,6 +175,11 @@ ordered shape/dtype contract differs from the profile. ONNX uses the same
 repeatable `--reference-input` interface. With a profile, names match the
 profile; without one, they match the ONNX graph inputs.
 
+For the supplied TinyGRU P16 training checkpoint, the repository includes
+`examples/tiny_gru_p16_checkpoint_loader.py`. It reconstructs the inference
+graph from weight dimensions and intentionally excludes the training-only
+pair-classifier head.
+
 ## Current limits
 
 - A state_dict-only PyTorch file requires `--model-loader`; model architecture

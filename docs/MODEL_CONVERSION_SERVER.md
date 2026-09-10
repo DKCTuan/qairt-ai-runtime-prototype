@@ -69,3 +69,9 @@ The tool compares every source and converted output and rejects a TFLite whose
 input/output shape or dtype differs from the profile. A state-dict checkpoint
 still needs trusted architecture code in `--model-loader`; tensor metadata
 cannot reconstruct an arbitrary model class.
+
+The supplied P16 archive contains both a TorchScript model and a training
+checkpoint. Try `tinygru_p16_final_torchscript.pt` first. If the installed
+LiteRT Torch version cannot convert a ScriptModule, use
+`modeltool/examples/tiny_gru_p16_checkpoint_loader.py` with
+`tinygru_p16_final_training_checkpoint.pt`.
