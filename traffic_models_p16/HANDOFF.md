@@ -152,5 +152,5 @@ aarch64-openwrt-linux-musl-gcc customer_app.c \
 
 Application chỉ cần `#include "traffic_ai.h"`; header này gom API RF và P16.
 
-`bin/app_traffic_ai_arm64` chỉ là smoke test P16, không thay thế test bằng
+`bin/app_arm64` chỉ là smoke test P16, không thay thế test bằng
 capture thật hoặc app khách hàng.

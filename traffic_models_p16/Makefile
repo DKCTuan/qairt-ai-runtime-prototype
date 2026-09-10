@@ -17,7 +17,7 @@ all: combined
 # A single public SDK for the current production pair: Random Forest + the
 # two-input TinyGRU P16.  The old one-input GRU is intentionally not linked.
 # It keeps the deployment to libtraffic_ai.so + its one P16 model dependency.
-combined: $(OUT)/libtraffic_ai.so $(OUT)/app_traffic_ai_arm64
+combined: $(OUT)/libtraffic_ai.so $(OUT)/app_arm64
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -35,7 +35,7 @@ $(OUT)/libtraffic_ai.so: traffic_p16.c traffic_p16.h \
 		-Wl,-soname,libtraffic_ai.so -o $@
 	$(STRIP) --strip-unneeded $@
 
-$(OUT)/app_traffic_ai_arm64: examples/p16_smoke.c traffic_p16.h generated/traffic_p16_deployment_config.h Makefile $(OUT)/libtraffic_ai.so
+$(OUT)/app_arm64: examples/p16_smoke.c traffic_p16.h generated/traffic_p16_deployment_config.h Makefile $(OUT)/libtraffic_ai.so
 	$(CC) $(CFLAGS) examples/p16_smoke.c -L$(OUT) -ltraffic_ai $(APP_GRU_LINK) \
 		-Wl,-rpath,'$$ORIGIN:$$ORIGIN/../lib' -o $@
 	$(STRIP) --strip-unneeded $@

@@ -42,7 +42,7 @@ make OUT=dist/traffic_ai \
   STRIP=aarch64-openwrt-linux-musl-strip
 ```
 
-The build produces `app_traffic_ai_arm64`, a deterministic smoke client. It
+The build produces `app_arm64`, a deterministic smoke client. It
 exercises the full raw-packet preprocessing path and is not a substitute for
 parity validation using a real captured window.
 

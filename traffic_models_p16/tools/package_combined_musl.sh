@@ -23,7 +23,7 @@ repo_root=$(cd -- "$script_dir/../.." && pwd)
 for file in \
     "$sdk_dir/libtraffic_ai.so" \
     "$sdk_dir/libtiny_gru_p16_float32.so" \
-    "$sdk_dir/app_traffic_ai_arm64"; do
+    "$sdk_dir/app_arm64"; do
     [[ -f $file ]] || { echo "error: missing artifact: $file" >&2; exit 1; }
 done
 
@@ -33,7 +33,7 @@ package="$output_root/$name"
 mkdir -p "$package/bin" "$package/include" "$package/lib" "$package/docs"
 
 cp "$sdk_dir/libtraffic_ai.so" "$sdk_dir/libtiny_gru_p16_float32.so" "$package/lib/"
-cp "$sdk_dir/app_traffic_ai_arm64" "$package/bin/"
+cp "$sdk_dir/app_arm64" "$package/bin/"
 cp "$repo_root/traffic_models_p16/traffic_p16.h" "$package/include/"
 cp "$repo_root/traffic_models_p16/generated/traffic_p16_deployment_config.h" "$package/include/"
 cp "$repo_root/traffic_models_p16/traffic_ai.h" "$package/include/"
