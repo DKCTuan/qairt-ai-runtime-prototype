@@ -53,6 +53,9 @@ cp "$model_profile" "$package/docs/model_profile.json"
 if [[ -f "$(dirname "$model_profile")/README.md" ]]; then
     cp "$(dirname "$model_profile")/README.md" "$package/docs/PROFILE.md"
 fi
+if [[ -f "$(dirname "$model_profile")/MODEL_COMPARISON.md" ]]; then
+    cp "$(dirname "$model_profile")/MODEL_COMPARISON.md" "$package/docs/"
+fi
 cp "$repo_root/traffic_models_p16/HANDOFF.md" "$package/docs/"
 cp "$repo_root/traffic_models_p16/MODEL_PROVENANCE.md" "$package/docs/"
 
