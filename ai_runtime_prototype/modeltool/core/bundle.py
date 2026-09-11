@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import tarfile
 import tempfile
@@ -17,6 +18,7 @@ from .manifest import read_json, write_json
 
 
 _SUPPORTED_MODEL_SUFFIXES = {".tflite", ".onnx", ".pt", ".pth"}
+_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def _sha256(file: Path) -> str:
@@ -36,6 +38,16 @@ def _inside(root: Path, candidate: Path, label: str) -> Path:
     if not resolved.is_file():
         raise ModelToolError("BUNDLE_ASSET_MISSING", f"{label} not found: {candidate}")
     return resolved
+
+
+def _validate_bundle_id(value: Any) -> str:
+    if not isinstance(value, str) or not _BUNDLE_ID_RE.fullmatch(value):
+        raise ModelToolError(
+            "BUNDLE_MANIFEST_INVALID",
+            "bundle_id must be 1-128 chars: letters, digits, '.', '_' or '-', "
+            "starting with a letter or digit",
+        )
+    return value
 
 
 def _safe_extract(zip_path: Path, destination: Path) -> None:
@@ -103,64 +115,72 @@ def _bundle_root(input_path: Path) -> tuple[Path, Path | None]:
 
 def load_bundle(value: str | Path) -> ModelBundle:
     root, temporary = _bundle_root(Path(value).expanduser())
-    manifest_path = root / "bundle.json"
-    if not manifest_path.is_file():
-        raise ModelToolError("BUNDLE_MANIFEST_MISSING", f"missing {manifest_path}")
     try:
-        manifest = read_json(manifest_path)
-    except (OSError, json.JSONDecodeError) as error:
+        manifest_path = root / "bundle.json"
+        if not manifest_path.is_file():
+            raise ModelToolError("BUNDLE_MANIFEST_MISSING", f"missing {manifest_path}")
+        try:
+            manifest = read_json(manifest_path)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"cannot read {manifest_path}: {error}") from error
+        if not isinstance(manifest, dict):
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID", "bundle.json must contain a JSON object")
+        if manifest.get("schema_version") != 1:
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID", "bundle.json requires schema_version=1")
+        _validate_bundle_id(manifest.get("bundle_id"))
+
+        def optional_asset(key: str) -> Path | None:
+            value = manifest.get(key)
+            if value is None:
+                return None
+            if not isinstance(value, str) or not value:
+                raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"{key} must be a non-empty relative path")
+            return _inside(root, root / value, key)
+
+        model = optional_asset("model")
+        if model is None:
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID", "bundle.json requires model")
+        if model.suffix.lower() not in _SUPPORTED_MODEL_SUFFIXES:
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID",
+                                 "model must end in one of: " + ", ".join(sorted(_SUPPORTED_MODEL_SUFFIXES)))
+        metadata = optional_asset("metadata")
+        if metadata:
+            try:
+                metadata_value = read_json(metadata)
+            except (OSError, json.JSONDecodeError) as error:
+                raise ModelToolError("BUNDLE_METADATA_INVALID", f"cannot read metadata {metadata}: {error}") from error
+            if not isinstance(metadata_value, dict):
+                raise ModelToolError("BUNDLE_METADATA_INVALID", "metadata must contain a JSON object")
+        loader = optional_asset("model_loader")
+        if loader and model.suffix.lower() not in {".pt", ".pth"}:
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID", "model_loader is only valid for .pt/.pth models")
+        references: list[str] = []
+        raw_references = manifest.get("reference_inputs", [])
+        if not isinstance(raw_references, list):
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID", "reference_inputs must be a list")
+        seen_names: set[str] = set()
+        for index, item in enumerate(raw_references):
+            if (not isinstance(item, dict)
+                    or not isinstance(item.get("name"), str)
+                    or not isinstance(item.get("path"), str)):
+                raise ModelToolError("BUNDLE_MANIFEST_INVALID",
+                                     f"reference_inputs[{index}] requires string name and path")
+            name = item["name"]
+            if not name or name in seen_names:
+                raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"duplicate/empty reference name: {name!r}")
+            seen_names.add(name)
+            reference = _inside(root, root / item["path"], f"reference_inputs[{index}]")
+            if reference.suffix.lower() != ".npy":
+                raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"reference input must be .npy: {reference}")
+            references.append(f"{name}={reference}")
+
+        return ModelBundle(root, manifest_path, manifest, model, metadata,
+                           optional_asset("model_profile"), loader,
+                           references, temporary)
+    except Exception:
         if temporary:
             shutil.rmtree(temporary, ignore_errors=True)
-        raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"cannot read {manifest_path}: {error}") from error
-    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("bundle_id"), str):
-        raise ModelToolError("BUNDLE_MANIFEST_INVALID", "bundle.json requires schema_version=1 and string bundle_id")
-
-    def optional_asset(key: str) -> Path | None:
-        value = manifest.get(key)
-        if value is None:
-            return None
-        if not isinstance(value, str) or not value:
-            raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"{key} must be a non-empty relative path")
-        return _inside(root, root / value, key)
-
-    model = optional_asset("model")
-    if model is None:
-        raise ModelToolError("BUNDLE_MANIFEST_INVALID", "bundle.json requires model")
-    if model.suffix.lower() not in _SUPPORTED_MODEL_SUFFIXES:
-        raise ModelToolError("BUNDLE_MANIFEST_INVALID",
-                             "model must end in one of: " + ", ".join(sorted(_SUPPORTED_MODEL_SUFFIXES)))
-    metadata = optional_asset("metadata")
-    if metadata:
-        try:
-            value = read_json(metadata)
-        except (OSError, json.JSONDecodeError) as error:
-            raise ModelToolError("BUNDLE_METADATA_INVALID", f"cannot read metadata {metadata}: {error}") from error
-        if not isinstance(value, dict):
-            raise ModelToolError("BUNDLE_METADATA_INVALID", "metadata must contain a JSON object")
-    loader = optional_asset("model_loader")
-    if loader and model.suffix.lower() not in {".pt", ".pth"}:
-        raise ModelToolError("BUNDLE_MANIFEST_INVALID", "model_loader is only valid for .pt/.pth models")
-    references: list[str] = []
-    raw_references = manifest.get("reference_inputs", [])
-    if not isinstance(raw_references, list):
-        raise ModelToolError("BUNDLE_MANIFEST_INVALID", "reference_inputs must be a list")
-    seen_names: set[str] = set()
-    for index, item in enumerate(raw_references):
-        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("path"), str):
-            raise ModelToolError("BUNDLE_MANIFEST_INVALID",
-                                 f"reference_inputs[{index}] requires string name and path")
-        name = item["name"]
-        if not name or name in seen_names:
-            raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"duplicate/empty reference name: {name!r}")
-        seen_names.add(name)
-        reference = _inside(root, root / item["path"], f"reference_inputs[{index}]")
-        if reference.suffix.lower() != ".npy":
-            raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"reference input must be .npy: {reference}")
-        references.append(f"{name}={reference}")
-
-    return ModelBundle(root, manifest_path, manifest, model, metadata,
-                       optional_asset("model_profile"), loader,
-                       references, temporary)
+        raise
 
 
 def validate_bundle_contract(bundle: ModelBundle) -> dict[str, Any]:
@@ -186,7 +206,7 @@ def validate_bundle_contract(bundle: ModelBundle) -> dict[str, Any]:
     for index, item in enumerate(inputs + outputs):
         group = "inputs" if index < len(inputs) else "outputs"
         local_index = index if group == "inputs" else index - len(inputs)
-        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"]:
             raise ModelToolError("BUNDLE_PROFILE_INVALID", f"{group}[{local_index}] needs a name")
         if item["name"] in seen_names:
             raise ModelToolError("BUNDLE_PROFILE_INVALID", f"duplicate tensor name: {item['name']}")
@@ -195,7 +215,8 @@ def validate_bundle_contract(bundle: ModelBundle) -> dict[str, Any]:
             raise ModelToolError("BUNDLE_PROFILE_INVALID",
                                  f"{group}[{local_index}] has unsupported dtype {item.get('dtype')!r}")
         shape = item.get("shape")
-        if not isinstance(shape, list) or not shape or not all(isinstance(size, int) and size > 0 for size in shape):
+        if (not isinstance(shape, list) or not shape
+                or not all(type(size) is int and size > 0 for size in shape)):
             raise ModelToolError("BUNDLE_PROFILE_INVALID", f"{group}[{local_index}] needs a static positive shape")
 
     if not bundle.references:
@@ -216,7 +237,11 @@ def validate_bundle_contract(bundle: ModelBundle) -> dict[str, Any]:
         raise ModelToolError("BUNDLE_REFERENCE_CONTRACT_MISMATCH",
                              f"reference names differ: expected={expected_names}, got={sorted(references)}")
     for item in inputs:
-        tensor = np.load(references[item["name"]], allow_pickle=False)
+        try:
+            tensor = np.load(references[item["name"]], allow_pickle=False)
+        except (OSError, ValueError) as error:
+            raise ModelToolError("BUNDLE_REFERENCE_INVALID",
+                                 f"cannot read reference {item['name']!r}: {error}") from error
         actual_dtype, actual_shape = np.dtype(tensor.dtype).name, list(tensor.shape)
         if actual_dtype != item["dtype"] or actual_shape != item["shape"]:
             raise ModelToolError(
@@ -224,6 +249,9 @@ def validate_bundle_contract(bundle: ModelBundle) -> dict[str, Any]:
                 f"reference {item['name']!r}: expected dtype={item['dtype']} shape={item['shape']}, "
                 f"got dtype={actual_dtype} shape={actual_shape}",
             )
+        if np.issubdtype(tensor.dtype, np.floating) and not np.isfinite(tensor).all():
+            raise ModelToolError("BUNDLE_REFERENCE_INVALID",
+                                 f"reference {item['name']!r} contains NaN or Inf")
     return {"status": "PASS", "profile": str(bundle.profile), "reference_inputs": expected_names}
 
 

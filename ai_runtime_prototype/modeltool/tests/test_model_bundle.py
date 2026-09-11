@@ -78,6 +78,17 @@ class ModelBundleTest(unittest.TestCase):
                 load_bundle(root)
             self.assertEqual("BUNDLE_PATH_INVALID", context.exception.code)
 
+    def test_bundle_id_must_be_filename_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_bundle(root)
+            manifest = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
+            manifest["bundle_id"] = "../bad"
+            (root / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(ModelToolError) as context:
+                load_bundle(root)
+            self.assertEqual("BUNDLE_MANIFEST_INVALID", context.exception.code)
+
     def test_reference_tensors_must_match_profile(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -98,6 +109,52 @@ class ModelBundleTest(unittest.TestCase):
             with self.assertRaises(ModelToolError) as context:
                 validate_bundle_contract(bundle)
             self.assertEqual("BUNDLE_REFERENCE_CONTRACT_MISMATCH", context.exception.code)
+
+    def test_float_reference_tensors_must_be_finite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_bundle(root)
+            (root / "contract").mkdir()
+            (root / "contract" / "profile.json").write_text(json.dumps({
+                "schema_version": 1,
+                "inputs": [{"name": "input", "dtype": "float32", "shape": [1, 2]}],
+                "outputs": [{"name": "output", "dtype": "float32", "shape": [1, 1]}],
+            }), encoding="utf-8")
+            np.save(root / "reference" / "input.npy", np.array([[0.0, np.nan]], dtype=np.float32))
+            manifest = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
+            manifest["model_profile"] = "contract/profile.json"
+            (root / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(ModelToolError) as context:
+                validate_bundle_contract(load_bundle(root))
+            self.assertEqual("BUNDLE_REFERENCE_INVALID", context.exception.code)
+
+    def test_profile_rejects_empty_names_and_bool_dimensions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_bundle(root)
+            (root / "contract").mkdir()
+            manifest = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
+            manifest["model_profile"] = "contract/profile.json"
+            manifest.pop("reference_inputs")
+            (root / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            (root / "contract" / "profile.json").write_text(json.dumps({
+                "schema_version": 1,
+                "inputs": [{"name": "", "dtype": "float32", "shape": [1, 2]}],
+                "outputs": [{"name": "output", "dtype": "float32", "shape": [1, 1]}],
+            }), encoding="utf-8")
+            with self.assertRaises(ModelToolError) as context:
+                validate_bundle_contract(load_bundle(root))
+            self.assertEqual("BUNDLE_PROFILE_INVALID", context.exception.code)
+
+            (root / "contract" / "profile.json").write_text(json.dumps({
+                "schema_version": 1,
+                "inputs": [{"name": "input", "dtype": "float32", "shape": [True, 2]}],
+                "outputs": [{"name": "output", "dtype": "float32", "shape": [1, 1]}],
+            }), encoding="utf-8")
+            with self.assertRaises(ModelToolError) as context:
+                validate_bundle_contract(load_bundle(root))
+            self.assertEqual("BUNDLE_PROFILE_INVALID", context.exception.code)
 
     def test_delivery_package_contains_headers_and_not_source_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
