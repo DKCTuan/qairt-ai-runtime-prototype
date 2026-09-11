@@ -2,46 +2,47 @@
 
 Model cũ là `tinygru-p16-v1`; model mới là
 `tinygru-p16-h48x2-cap025-v1`. Random Forest trong `libtraffic_ai.so` không
-đổi. Bảng này chỉ nói về nhánh TinyGRU/P16.
+đổi. Bảng này chỉ so sánh nhánh TinyGRU/P16.
 
-| Hạng mục | P16 cũ | H48x2 cap-0.25 mới | Ảnh hưởng tích hợp |
+| Hạng mục | P16 cũ | H48x2 cap-0.25 mới | Ý nghĩa triển khai |
 | --- | --- | --- | --- |
-| Model ID | `tinygru-p16-v1` | `tinygru-p16-h48x2-cap025-v1` | Log ID để tránh nạp nhầm release. |
-| Số input / ABI | 2: `[1,90,3] float32`, `[1,90] int32` | Không đổi | App vẫn truyền 90 packet và một remote IPv4. |
-| Numeric features | `log1p(length), log1p(IAT), direction`; z-score cả 3 | Không đổi về ý nghĩa/thứ tự | App không tự normalize. Mean/std được SDK mới thay đúng theo model. |
-| Direction | `+1` LAN→WAN, `-1` WAN→LAN | Không đổi | App tiếp tục truyền direction theo quy ước này. |
-| P16 | global-unicast remote IPv4 `/16`; ID 0 là UNK | Không đổi | Một remote chung cho 90 packet vẫn hợp lệ. |
-| GRU input | Numeric 3 + P16 embedding 8 = 11; early fusion | Numeric 3; late fusion | Không thay input app, nhưng không được dùng TFLite cũ với SDK/profile mới. |
-| GRU | hidden 64, 2 layers | hidden 48, 2 layers | Model mới nhỏ hơn. |
-| P16 embedding | dim 8, đưa vào từng timestep GRU | dim 2, average-pool các ID khác UNK | Tín hiệu IP mới chỉ điều chỉnh logits cuối. |
-| IP contribution | Học chung bên trong GRU | `0.25 * tanh(ip_to_logits(mean_embedding))` | Ảnh hưởng IP bị giới hạn biên ±0.25 logit. |
-| Inference parameters | khoảng 45.5k | 24,731 | Giảm gần 46% parameter. |
-| Window | 90 packet, skip 10, stride 90 | 90 packet, skip 0, stride 90 | Đây là thay đổi deployment quan trọng nhất: window đầu mới là packet 1–90. |
-| Output | raw logits `[1,5]` | raw logits `[1,5]` | Class order vẫn: Background, Game, RTVideo, Voice, VStream. |
-| Confidence policy | không có ngưỡng accept trong profile cũ | softmax temperature 1.0; accept nếu confidence ≥ 0.98 | Dùng `result.accepted` trước khi tự động áp nhãn mới. |
+| Input application mỗi lần inference | 90 packet | 90 packet | **Không đổi API app:** truyền timestamp, length, direction cho 90 packet và một remote IPv4 global dùng chung. |
+| Numeric features | `log1p(length)`, `log1p(IAT)`, `direction` | Giữ nguyên | SDK tự tính IAT, transform và normalize; app không tự normalize. |
+| P16 | Remote IPv4 `/16`, ID `0` là UNK | Giữ nguyên; vocabulary 142 ID | IP không hợp lệ/chưa gặp vẫn chạy qua UNK. |
+| Kiến trúc kết hợp IP | **Early fusion**: embedding IP ở từng timestep đi vào GRU | **Late fusion**: GRU chỉ xử lý traffic; IP chỉ hiệu chỉnh logits cuối | Model mới ít phụ thuộc vào IP hơn. |
+| P16 embedding | 8 chiều | 2 chiều, average-pool trên window | Giảm footprint và chi phí tính toán. |
+| GRU | 2 layer, hidden 64; input 11D | 2 layer, hidden 48; input 3D | Nhánh traffic của model mới nhẹ hơn. |
+| Ảnh hưởng IP | Học trực tiếp trong trạng thái GRU | `0.25 × tanh(...)`, giới hạn ±0.25 mỗi logit | IP không thể lấn át tín hiệu traffic. |
+| Inference parameters | khoảng 45.5k | 24,731 | Giảm gần 46% số tham số. |
+| GRU compute | khoảng 3.5M MACs/window | khoảng 1.905M MACs/window | Model mới phù hợp hơn với CPU nhúng. |
+| Direction khi train | private/public heuristic | Ưu tiên inferred device endpoint, rồi fallback private/public | Khi deploy, ưu tiên app truyền direction router-authoritative: `+1` LAN→WAN, `-1` WAN→LAN. |
+| Training balance | Weighted loss; session dài có thể đóng góp nhiều window | Cân bằng class, giới hạn 512 unique window/session/epoch, không replacement trong epoch | Giảm bias từ class hoặc session dài. |
+| Output/class order | logits `[1,5]`: Background, Game, RTVideo, Voice, VStream | Giữ nguyên | Không đổi mapping label P16. |
+| Confidence policy | Model luôn trả prediction | Model luôn trả prediction; SDK đánh dấu `accepted` khi confidence ≥ 0.98 | `0.98` là policy SDK/app, không nằm bên trong model. |
 
-## Giá trị normalization
+## Ý nghĩa của late fusion
 
-| Channel | P16 cũ mean / std | H48x2 mới mean / std |
-| --- | --- | --- |
-| `log1p_packet_length` | `6.0075965 / 1.3676786` | `6.0075564 / 1.3676575` |
-| `log1p_nonnegative_iat` | `0.0020584022 / 0.021586655` | `0.0020678083 / 0.021813218` |
-| `direction` | `-0.16327207 / 0.9865821` | `-0.16352206 / 0.9865407` |
-
-Không copy mean/std cũ sang model mới. `traffic_p16_default_config()` trong
-release đã chứa đúng constants của model H48x2.
-
-## API cần dùng
-
-App của anh Kiên tiếp tục gọi:
-
-```c
-traffic_p16_predict_directional_packets(
-    packets, TRAFFIC_P16_WINDOW_SIZE, remote_global_ipv4,
-    traffic_p16_default_config(), &result);
+```text
+P16 cũ: numeric(3) + P16 embedding(8) → GRU H64×2 → 5 logits
+Mới:    numeric(3) → GRU H48×2 → traffic logits
+         P16 IDs → embedding(2) → average pool → capped IP correction
+         traffic logits + IP correction → 5 logits
 ```
 
-Sau khi gọi thành công, kiểm tra `result.label`, `result.confidence`, và
-`result.accepted`. Không cần đổi format 90×3; chỉ cần đổi policy lấy window từ
-skip-10 sang không skip, đồng thời deploy đồng bộ `libtraffic_ai.so` và
-`libtinygru_h48x2_cap025.so` của cùng archive này.
+Với model mới, nếu remote IP lạ hoặc không có thì P16 map sang `UNK=0` và
+phần hiệu chỉnh IP suy giảm; nhánh GRU dựa trên traffic vẫn hoạt động độc lập.
+
+## Normalization và đóng gói
+
+Không copy mean/std của model cũ sang model mới. Release chứa đúng vocabulary
+và normalization của H48x2 trong `traffic_p16_default_config()`. Luôn deploy
+đồng bộ `libtraffic_ai.so` và `libtinygru_h48x2_cap025.so` từ cùng archive.
+
+## Đánh giá và phạm vi checkpoint deploy
+
+Kiến trúc H48×2 cap-0.25 được chọn qua các thí nghiệm session-disjoint trước
+khi chốt kiến trúc. Checkpoint trong release là checkpoint **final**, train lại
+trên toàn bộ dataset sau khi kiến trúc và preprocessing đã freeze. Vì vậy,
+không gán held-out accuracy/F1 từ experiment cũ cho checkpoint này; các file
+`TRAIN_ONLY_*` chỉ là sanity check. Xác thực cuối cùng cần dùng fresh captures
+chưa tham gia train hoặc model selection.
