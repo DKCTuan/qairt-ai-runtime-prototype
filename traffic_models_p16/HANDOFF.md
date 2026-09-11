@@ -5,9 +5,9 @@
 | Thư viện | Vai trò |
 | --- | --- |
 | `libtraffic_ai.so` | **SDK công khai duy nhất:** Random Forest và API TinyGRU P16 |
-| `libtiny_gru_p16_float32.so` | Model TinyGRU P16 hai input |
+| `lib*.so` còn lại | Model TinyGRU P16 hai input được chọn bởi `docs/model_profile.json` |
 
-`docs/model_profile.json` ghi lại chính xác model ID, preprocessing adapter,
+`docs/model_profile.json` và `docs/PROFILE.md` ghi lại chính xác model ID, preprocessing adapter,
 thứ tự/shape/dtype tensor và class order của bundle. Ứng dụng cũng có thể ghi
 log `traffic_ai_model_id()` và `traffic_ai_preprocessing_id()` để xác nhận
 đang nạp đúng release.
@@ -38,8 +38,8 @@ sha256sum -c SHA256SUMS
 
 ## Random Forest
 
-Giữ nguyên tích hợp RF hiện có. Một window là 90 packet sau khi bỏ 10 packet
-đầu của flow; timestamp là microseconds không giảm. Input application và input
+Giữ nguyên tích hợp RF hiện có. Một window là 90 packet; chính sách bỏ packet
+đầu là của profile được đóng gói (`traffic_ai_skip_packets()`). Input application và input
 thật của API RF là:
 
 | Field | C type | Số lượng | Đơn vị/ý nghĩa |
@@ -63,9 +63,9 @@ direction hay IPv4 address.
 ## TinyGRU P16
 
 Không đưa trực tiếp vector `[90][3]` cho P16. SDK tạo hai input model từ 90
-packet thô sau khi bỏ 10 packet đầu. Một flow cần tối thiểu 100 packet: bỏ
-packet gốc 1–10, rồi packet 11–100 trở thành window đầu tiên. Window tiếp theo
-dùng stride 90.
+packet thô. Đọc `skip_packets` trong `docs/model_profile.json` hoặc gọi
+`traffic_ai_skip_packets()`; không hard-code 10. Window tiếp theo dùng stride
+được ghi trong profile.
 
 ### Input application → SDK: mode một remote IP cho một window
 
@@ -80,7 +80,7 @@ traffic_p16_result_t p16;
 uint32_t remote_global_ipv4 = 0x14ca327bU; /* 20.202.50.123, host-order */
 
 /* Per packet:
- * timestamp_us       : microseconds, non-decreasing within flow
+ * timestamp_us       : microseconds; timestamp đảo thứ tự được SDK clamp IAT về 0
  * packet_length      : same meaning as the training CSV's Length column
  * direction          : +1 local -> remote; -1 remote -> local
  */
@@ -97,9 +97,9 @@ const char *name = traffic_p16_class_name(p16.label);
 traffic_p16_model_deinit();
 ```
 
-`remote_global_ipv4` phải là IPv4 global-unicast ở **host-order** và phải thật
-sự giống nhau cho tất cả 90 packet. SDK lookup `/16` một lần, rồi dùng ID đó
-cho toàn bộ tensor `[1,90]`. Nếu window có nhiều remote IP, không dùng API
+`remote_global_ipv4` phải thật sự giống nhau cho tất cả 90 packet và ở
+**host-order**. SDK lookup `/16` một lần, rồi dùng ID đó cho toàn bộ tensor
+`[1,90]`; remote invalid/non-global/unseen được map sang `UNK=0`. Nếu window có nhiều remote IP, không dùng API
 này; dùng API `traffic_p16_predict_packets()` với source/destination IPv4 cho
 từng packet.
 
@@ -115,11 +115,11 @@ SDK tạo đúng hai tensor này; application **không** tự tạo chúng:
 
 | TFLite input | Shape / dtype | Giá trị ở packet `i` |
 | --- | --- | --- |
-| Numeric input #0 | `[1,90,3] float32` | channel 0: `(log1p(packet_length)-6.0075965)/1.3676786` |
-|  |  | channel 1: `(log1p(max(IAT_seconds,0))-0.0020584022)/0.021586655` |
-|  |  | channel 2: `(direction-(-0.16327207))/0.9865821` |
+| Numeric input #0 | `[1,90,3] float32` | channel 0: z-score của `log1p(packet_length)` theo mean/std trong profile |
+|  |  | channel 1: z-score của `log1p(max(IAT_seconds,0))` theo profile |
+|  |  | channel 2: z-score của `direction` theo profile |
 | P16 input #1 | `[1,90] int32` | embedding ID của remote global-unicast IPv4 `/16`; không có prefix hợp lệ là `0` (UNK) |
-| Output #0 | `[1,5] float32` | five logits/scores; lấy index score lớn nhất làm `label` |
+| Output #0 | `[1,5] float32` | five raw logits; SDK lấy argmax làm `label`, softmax thành `confidence`, và áp `accept_threshold` của profile |
 
 `IAT_seconds` tại packet đầu của window là `0`; các packet sau là chênh lệch
 timestamp hiện tại với timestamp trước đó, đổi từ microseconds sang seconds.
@@ -160,8 +160,9 @@ Application chỉ cần `#include "traffic_ai.h"`; header này gom API RF và P1
 Có thể xác nhận profile đã link trước khi chạy traffic thật:
 
 ```c
-printf("model=%s preprocessing=%s\n",
-       traffic_ai_model_id(), traffic_ai_preprocessing_id());
+printf("model=%s preprocessing=%s skip=%zu threshold=%.3f\n",
+       traffic_ai_model_id(), traffic_ai_preprocessing_id(),
+       traffic_ai_skip_packets(), traffic_ai_accept_threshold());
 ```
 
 `bin/app_arm64` chỉ là smoke test P16, không thay thế test bằng
