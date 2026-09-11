@@ -38,7 +38,8 @@ fi
 [[ -f $model_profile ]] || { echo "error: missing model profile: $model_profile" >&2; exit 1; }
 
 mkdir -p "$output_root"
-name="traffic_ai_qsdk_musl_unified_rf_p16_$(date +%Y%m%d_%H%M%S)"
+profile_name=$(basename "$(dirname "$model_profile")")
+name="traffic_ai_qsdk_musl_unified_rf_${profile_name}_$(date +%Y%m%d_%H%M%S)"
 package="$output_root/$name"
 mkdir -p "$package/bin" "$package/include" "$package/lib" "$package/docs"
 
@@ -49,6 +50,9 @@ cp "$(dirname "$model_profile")/traffic_p16_deployment_config.h" "$package/inclu
 cp "$repo_root/traffic_models_p16/traffic_ai.h" "$package/include/"
 cp "$repo_root/traffic_models_p16/model_contract.h" "$package/include/"
 cp "$model_profile" "$package/docs/model_profile.json"
+if [[ -f "$(dirname "$model_profile")/README.md" ]]; then
+    cp "$(dirname "$model_profile")/README.md" "$package/docs/PROFILE.md"
+fi
 cp "$repo_root/traffic_models_p16/HANDOFF.md" "$package/docs/"
 cp "$repo_root/traffic_models_p16/MODEL_PROVENANCE.md" "$package/docs/"
 

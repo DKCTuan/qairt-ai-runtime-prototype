@@ -24,9 +24,11 @@ int main(void)
         fprintf(stderr, "traffic_p16_predict_packets failed: %d\n", status);
         return 1;
     }
-    printf("model=%s\npreprocessing=%s\nlabel=%d\nclass=%s\nscores=",
-           traffic_ai_model_id(), traffic_ai_preprocessing_id(), result.label,
-           traffic_p16_class_name(result.label));
+    printf("model=%s\npreprocessing=%s\nskip_packets=%zu\nlabel=%d\nclass=%s\n"
+           "confidence=%.8g\naccepted=%d\nscores=",
+           traffic_ai_model_id(), traffic_ai_preprocessing_id(),
+           traffic_ai_skip_packets(), result.label, traffic_p16_class_name(result.label),
+           result.confidence, result.accepted);
     for (int i = 0; i < TRAFFIC_P16_CLASS_COUNT; ++i)
         printf("%s%.8g", i == 0 ? "" : ",", result.scores[i]);
     printf("\nlatency_ms=%.3f\n", result.latency_ms);
