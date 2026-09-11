@@ -7,6 +7,7 @@ layout.  It delegates only the ARM64 `.tflite -> .so` link step to the proven
 """
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
@@ -89,9 +90,14 @@ def validate_tflite_profile(io: dict, profile: dict) -> None:
 
 
 def source_manifest(source: Path, kind: str) -> dict:
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
     return {
         "name": source.stem,
         "source_model": str(source),
+        "source_sha256": digest.hexdigest(),
         "source_framework": {"pytorch": "pytorch", "onnx": "onnx", "tflite": "tflite"}[kind],
         "source_format": source.suffix.lower().removeprefix("."),
     }

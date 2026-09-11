@@ -1,5 +1,6 @@
 import json
 import shutil
+import tempfile
 from pathlib import Path
 
 from ..core.errors import ModelToolError
@@ -44,10 +45,9 @@ def convert_onnx(source: Path, output: Path, *, converter: Path,
                  input_shapes: list[str], log_path: Path) -> dict:
     if not converter.is_file():
         raise ModelToolError("ONNX_ENVIRONMENT_MISSING", f"onnx2tf not found: {converter}")
-    work = output.with_suffix(".onnx2tf-work")
-    if work.exists():
-        shutil.rmtree(work)
-    command = [str(converter), "-i", str(source), "-o", str(work), "-nuo", "--non_verbose"]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=output.stem + ".onnx2tf-", dir=output.parent))
+    command = [str(converter), "-i", str(source), "-o", str(work), "-nuo", "--non_verbose", "-coion"]
     if input_shapes:
         command.extend(["-ois", *input_shapes])
     run(command, log_path=log_path, extra_env={"CUDA_VISIBLE_DEVICES": ""})
@@ -55,7 +55,9 @@ def convert_onnx(source: Path, output: Path, *, converter: Path,
     if not candidates:
         raise ModelToolError("CONVERSION_FAILED", f"onnx2tf produced no .tflite; see: {log_path}")
     preferred = [path for path in candidates if "float32" in path.name.lower()]
-    selected = preferred[0] if len(preferred) == 1 else candidates[0]
+    if len(preferred) != 1:
+        raise ModelToolError("CONVERSION_AMBIGUOUS", f"expected exactly one float32 TFLite, got {candidates}; work retained: {work}")
+    selected = preferred[0]
     output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(selected, output)
     shutil.rmtree(work, ignore_errors=True)
@@ -78,6 +80,9 @@ arguments = json.loads(encoded_inputs)
 profile_names = json.loads(encoded_names)
 session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
 source_inputs = session.get_inputs()
+source_names = [item.name for item in source_inputs]
+if profile_names and set(profile_names) != set(source_names):
+    raise RuntimeError("profile input names must match ONNX input names explicitly")
 named, positional = {}, []
 for argument in arguments:
     if "=" in argument:
@@ -90,7 +95,7 @@ for argument in arguments:
 if named and positional:
     raise RuntimeError("do not mix named and positional reference inputs")
 if named:
-    ordered_names = profile_names or [item.name for item in source_inputs]
+    ordered_names = source_names
     expected = set(ordered_names)
     if set(named) != expected:
         raise RuntimeError("reference names differ from input contract: expected=" +
@@ -101,20 +106,38 @@ else:
         raise RuntimeError("reference input count differs from ONNX input count")
     paths = positional
 values = [np.load(path, allow_pickle=False) for path in paths]
+if len(values) != len(source_inputs):
+    raise RuntimeError("reference input count differs from ONNX input count")
+if any(not np.isfinite(value).all() for value in values):
+    raise RuntimeError("reference inputs contain NaN or infinity")
 source_output = session.run(None, {item.name: value for item, value in zip(source_inputs, values)})
 interpreter = tf.lite.Interpreter(model_path=tflite_path)
 interpreter.allocate_tensors()
 inputs, outputs = interpreter.get_input_details(), interpreter.get_output_details()
 if len(inputs) != len(values) or len(outputs) != len(source_output):
     raise RuntimeError("TFLite I/O count differs from ONNX output contract")
+def match_details(details, names):
+    by_name = {item["name"]: item for item in details}
+    if len(by_name) != len(details) or set(by_name) != set(names):
+        raise RuntimeError("ambiguous tensor mapping: preserve ONNX names with -coion; expected=" + str(names) + " got=" + str(list(by_name)))
+    return [by_name[name] for name in names]
+inputs = match_details(inputs, source_names)
+outputs = match_details(outputs, [item.name for item in session.get_outputs()])
 for detail, value in zip(inputs, values):
     expected_shape = tuple(int(x) for x in detail["shape"])
     if tuple(value.shape) != expected_shape:
         raise RuntimeError("reference shape differs from TFLite input " + detail["name"] +
                            ": expected=" + str(expected_shape) + " got=" + str(value.shape))
-    interpreter.set_tensor(detail["index"], value.astype(detail["dtype"], copy=False))
+    if value.dtype != detail["dtype"]:
+        raise RuntimeError("input dtype mismatch: " + detail["name"])
+    interpreter.set_tensor(detail["index"], value)
 interpreter.invoke()
 tflite_output = [interpreter.get_tensor(x["index"]) for x in outputs]
+for a, b in zip(source_output, tflite_output):
+    if a.shape != b.shape or a.dtype != b.dtype or not a.size:
+        raise RuntimeError("output shape/dtype mismatch or empty output")
+    if not np.isfinite(a).all() or not np.isfinite(b).all():
+        raise RuntimeError("outputs contain NaN or infinity")
 errors = [np.abs(a - b) for a, b in zip(source_output, tflite_output)]
 max_abs = max(float(x.max()) for x in errors)
 max_rel = max(float((x / np.maximum(np.abs(a), 1e-12)).max())

@@ -381,6 +381,11 @@ def main() -> None:
                         else np.asarray(value) for value in reference_values]
     converted_arrays = [value.detach().cpu().numpy() if hasattr(value, "detach")
                         else np.asarray(value) for value in converted_values]
+    for index, (reference, converted) in enumerate(zip(reference_arrays, converted_arrays)):
+        if reference.shape != converted.shape or reference.dtype != converted.dtype or not reference.size:
+            fail(f"output {index} shape/dtype mismatch or empty output")
+        if not np.isfinite(reference).all() or not np.isfinite(converted).all():
+            fail(f"output {index} contains NaN or infinity")
     errors = [float(np.max(np.abs(reference - converted)))
               for reference, converted in zip(reference_arrays, converted_arrays)]
     if not all(np.allclose(reference, converted, rtol=1e-4, atol=1e-5)
