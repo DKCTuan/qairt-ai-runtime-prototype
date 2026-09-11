@@ -33,7 +33,8 @@ class ModelBundleTest(unittest.TestCase):
             self.write_bundle(root)
             bundle = load_bundle(root)
             self.assertEqual("example-v1", bundle.manifest["bundle_id"])
-            self.assertEqual([f"input={root / 'reference' / 'input.npy'}"], bundle.references)
+            self.assertEqual([f"input={root / 'reference' / 'input.npy'}"], bundle.reference_inputs)
+            self.assertEqual([], bundle.reference_outputs)
             self.assertEqual(64, len(bundle.provenance()["assets_sha256"]["model"]))
 
     def test_missing_references_are_warning_not_pass(self) -> None:
@@ -106,6 +107,33 @@ class ModelBundleTest(unittest.TestCase):
             bundle = load_bundle(root)
             self.assertEqual("PASS", validate_bundle_contract(bundle)["status"])
             np.save(root / "reference" / "input.npy", np.zeros((1, 3), dtype=np.float32))
+            with self.assertRaises(ModelToolError) as context:
+                validate_bundle_contract(bundle)
+            self.assertEqual("BUNDLE_REFERENCE_CONTRACT_MISMATCH", context.exception.code)
+
+    def test_reference_outputs_are_validated_when_supplied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_bundle(root)
+            (root / "contract").mkdir()
+            (root / "contract" / "profile.json").write_text(json.dumps({
+                "schema_version": 1,
+                "inputs": [{"name": "input", "dtype": "float32", "shape": [1, 2]}],
+                "outputs": [{"name": "scores", "dtype": "float32", "shape": [1, 5]}],
+            }), encoding="utf-8")
+            np.save(root / "reference" / "input.npy", np.zeros((1, 2), dtype=np.float32))
+            np.save(root / "reference" / "scores.npy", np.zeros((1, 5), dtype=np.float32))
+            manifest = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
+            manifest["model_profile"] = "contract/profile.json"
+            manifest["reference_outputs"] = [{"name": "scores", "path": "reference/scores.npy"}]
+            (root / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+            bundle = load_bundle(root)
+            report = validate_bundle_contract(bundle)
+            self.assertEqual("PASS", report["status"])
+            self.assertEqual(["scores"], report["reference_outputs"])
+            self.assertIn("reference_output:scores", bundle.provenance()["assets_sha256"])
+
+            np.save(root / "reference" / "scores.npy", np.zeros((1, 4), dtype=np.float32))
             with self.assertRaises(ModelToolError) as context:
                 validate_bundle_contract(bundle)
             self.assertEqual("BUNDLE_REFERENCE_CONTRACT_MISMATCH", context.exception.code)

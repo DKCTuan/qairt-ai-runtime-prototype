@@ -57,12 +57,14 @@ generated C headers, profile/metadata, reports, provenance hashes and
 `SHA256SUMS`. Source checkpoints and Python loaders are intentionally omitted
 from the delivery archive.
 
-If the bundle includes `model_profile.json`, every reference tensor is checked
-locally before conversion: each name, dtype and static shape must match the
-profile. A bundle without reference tensors is accepted for inspection, but
-reported as a **warning**; a PyTorch conversion then needs the explicit
+If the bundle includes `model_profile.json`, every reference input and optional
+reference output tensor is checked locally before conversion: each name, dtype
+and static shape must match the profile, and floating tensors must contain only
+finite values. A bundle without reference inputs is accepted for inspection,
+but reported as a **warning**; a PyTorch conversion then needs the explicit
 `--allow-synthetic-validation` smoke-test override. Production releases should
-always include real, preprocessed reference tensors.
+always include real, preprocessed reference inputs, and should include
+`reference_outputs` when the notebook can export golden logits/probabilities.
 
 ## Artifact layout
 

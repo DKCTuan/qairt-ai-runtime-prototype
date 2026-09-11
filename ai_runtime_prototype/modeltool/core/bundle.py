@@ -50,6 +50,29 @@ def _validate_bundle_id(value: Any) -> str:
     return value
 
 
+def _parse_reference_assets(root: Path, manifest: dict[str, Any], key: str) -> list[str]:
+    references: list[str] = []
+    raw_references = manifest.get(key, [])
+    if not isinstance(raw_references, list):
+        raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"{key} must be a list")
+    seen_names: set[str] = set()
+    for index, item in enumerate(raw_references):
+        if (not isinstance(item, dict)
+                or not isinstance(item.get("name"), str)
+                or not isinstance(item.get("path"), str)):
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID",
+                                 f"{key}[{index}] requires string name and path")
+        name = item["name"]
+        if not name or name in seen_names:
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"duplicate/empty {key} name: {name!r}")
+        seen_names.add(name)
+        reference = _inside(root, root / item["path"], f"{key}[{index}]")
+        if reference.suffix.lower() != ".npy":
+            raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"{key} must be .npy: {reference}")
+        references.append(f"{name}={reference}")
+    return references
+
+
 def _safe_extract(zip_path: Path, destination: Path) -> None:
     with ZipFile(zip_path) as archive:
         for member in archive.infolist():
@@ -73,8 +96,13 @@ class ModelBundle:
     metadata: Path | None
     profile: Path | None
     loader: Path | None
-    references: list[str]
+    reference_inputs: list[str]
+    reference_outputs: list[str]
     temporary_root: Path | None = None
+
+    @property
+    def references(self) -> list[str]:
+        return self.reference_inputs
 
     def cleanup(self) -> None:
         if self.temporary_root:
@@ -86,9 +114,12 @@ class ModelBundle:
                             ("model_loader", self.loader)):
             if file:
                 assets[label] = _sha256(file)
-        for item in self.references:
+        for item in self.reference_inputs:
             name, filename = item.split("=", 1)
-            assets[f"reference:{name}"] = _sha256(Path(filename))
+            assets[f"reference_input:{name}"] = _sha256(Path(filename))
+        for item in self.reference_outputs:
+            name, filename = item.split("=", 1)
+            assets[f"reference_output:{name}"] = _sha256(Path(filename))
         return {
             "schema_version": 1,
             "bundle_id": self.manifest["bundle_id"],
@@ -111,6 +142,32 @@ def _bundle_root(input_path: Path) -> tuple[Path, Path | None]:
         return children[0], temporary
     shutil.rmtree(temporary, ignore_errors=True)
     raise ModelToolError("BUNDLE_MANIFEST_MISSING", "bundle ZIP must contain bundle.json at its root")
+
+
+def _validate_reference_tensors(*, np: Any, references: list[str],
+                                specs: list[dict[str, Any]], label: str) -> list[str]:
+    by_name = dict(item.split("=", 1) for item in references)
+    expected_names = [item["name"] for item in specs]
+    if set(by_name) != set(expected_names):
+        raise ModelToolError("BUNDLE_REFERENCE_CONTRACT_MISMATCH",
+                             f"{label} names differ: expected={expected_names}, got={sorted(by_name)}")
+    for item in specs:
+        try:
+            tensor = np.load(by_name[item["name"]], allow_pickle=False)
+        except (OSError, ValueError) as error:
+            raise ModelToolError("BUNDLE_REFERENCE_INVALID",
+                                 f"cannot read {label} {item['name']!r}: {error}") from error
+        actual_dtype, actual_shape = np.dtype(tensor.dtype).name, list(tensor.shape)
+        if actual_dtype != item["dtype"] or actual_shape != item["shape"]:
+            raise ModelToolError(
+                "BUNDLE_REFERENCE_CONTRACT_MISMATCH",
+                f"{label} {item['name']!r}: expected dtype={item['dtype']} shape={item['shape']}, "
+                f"got dtype={actual_dtype} shape={actual_shape}",
+            )
+        if np.issubdtype(tensor.dtype, np.floating) and not np.isfinite(tensor).all():
+            raise ModelToolError("BUNDLE_REFERENCE_INVALID",
+                                 f"{label} {item['name']!r} contains NaN or Inf")
+    return expected_names
 
 
 def load_bundle(value: str | Path) -> ModelBundle:
@@ -154,29 +211,12 @@ def load_bundle(value: str | Path) -> ModelBundle:
         loader = optional_asset("model_loader")
         if loader and model.suffix.lower() not in {".pt", ".pth"}:
             raise ModelToolError("BUNDLE_MANIFEST_INVALID", "model_loader is only valid for .pt/.pth models")
-        references: list[str] = []
-        raw_references = manifest.get("reference_inputs", [])
-        if not isinstance(raw_references, list):
-            raise ModelToolError("BUNDLE_MANIFEST_INVALID", "reference_inputs must be a list")
-        seen_names: set[str] = set()
-        for index, item in enumerate(raw_references):
-            if (not isinstance(item, dict)
-                    or not isinstance(item.get("name"), str)
-                    or not isinstance(item.get("path"), str)):
-                raise ModelToolError("BUNDLE_MANIFEST_INVALID",
-                                     f"reference_inputs[{index}] requires string name and path")
-            name = item["name"]
-            if not name or name in seen_names:
-                raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"duplicate/empty reference name: {name!r}")
-            seen_names.add(name)
-            reference = _inside(root, root / item["path"], f"reference_inputs[{index}]")
-            if reference.suffix.lower() != ".npy":
-                raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"reference input must be .npy: {reference}")
-            references.append(f"{name}={reference}")
+        reference_inputs = _parse_reference_assets(root, manifest, "reference_inputs")
+        reference_outputs = _parse_reference_assets(root, manifest, "reference_outputs")
 
         return ModelBundle(root, manifest_path, manifest, model, metadata,
                            optional_asset("model_profile"), loader,
-                           references, temporary)
+                           reference_inputs, reference_outputs, temporary)
     except Exception:
         if temporary:
             shutil.rmtree(temporary, ignore_errors=True)
@@ -231,28 +271,15 @@ def validate_bundle_contract(bundle: ModelBundle) -> dict[str, Any]:
         import numpy as np
     except ImportError as error:
         raise ModelToolError("BUNDLE_REFERENCE_INVALID", "numpy is required to validate .npy references") from error
-    references = dict(item.split("=", 1) for item in bundle.references)
-    expected_names = [item["name"] for item in inputs]
-    if set(references) != set(expected_names):
-        raise ModelToolError("BUNDLE_REFERENCE_CONTRACT_MISMATCH",
-                             f"reference names differ: expected={expected_names}, got={sorted(references)}")
-    for item in inputs:
-        try:
-            tensor = np.load(references[item["name"]], allow_pickle=False)
-        except (OSError, ValueError) as error:
-            raise ModelToolError("BUNDLE_REFERENCE_INVALID",
-                                 f"cannot read reference {item['name']!r}: {error}") from error
-        actual_dtype, actual_shape = np.dtype(tensor.dtype).name, list(tensor.shape)
-        if actual_dtype != item["dtype"] or actual_shape != item["shape"]:
-            raise ModelToolError(
-                "BUNDLE_REFERENCE_CONTRACT_MISMATCH",
-                f"reference {item['name']!r}: expected dtype={item['dtype']} shape={item['shape']}, "
-                f"got dtype={actual_dtype} shape={actual_shape}",
-            )
-        if np.issubdtype(tensor.dtype, np.floating) and not np.isfinite(tensor).all():
-            raise ModelToolError("BUNDLE_REFERENCE_INVALID",
-                                 f"reference {item['name']!r} contains NaN or Inf")
-    return {"status": "PASS", "profile": str(bundle.profile), "reference_inputs": expected_names}
+    input_names = _validate_reference_tensors(np=np, references=bundle.reference_inputs,
+                                              specs=inputs, label="reference input")
+    result = {"status": "PASS", "profile": str(bundle.profile), "reference_inputs": input_names}
+    if bundle.reference_outputs:
+        result["reference_outputs"] = _validate_reference_tensors(
+            np=np, references=bundle.reference_outputs, specs=outputs, label="reference output")
+    else:
+        result["reference_outputs"] = "not supplied"
+    return result
 
 
 def create_delivery_package(*, bundle: ModelBundle, build_root: Path, output: Path) -> Path:

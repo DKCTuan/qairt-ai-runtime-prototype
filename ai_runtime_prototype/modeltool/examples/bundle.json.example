@@ -8,5 +8,8 @@
   "reference_inputs": [
     {"name": "numeric", "path": "reference/numeric.npy"},
     {"name": "category_ids", "path": "reference/category_ids.npy"}
+  ],
+  "reference_outputs": [
+    {"name": "scores", "path": "reference/scores.npy"}
   ]
 }

@@ -344,7 +344,8 @@ def cmd_inspect_bundle(args) -> None:
             "metadata": str(bundle.metadata) if bundle.metadata else None,
             "model_profile": str(bundle.profile) if bundle.profile else None,
             "model_loader": str(bundle.loader) if bundle.loader else None,
-            "reference_inputs": bundle.references,
+            "reference_inputs": bundle.reference_inputs,
+            "reference_outputs": bundle.reference_outputs,
             "contract_validation": contract,
             "provenance": bundle.provenance(),
         }, indent=2))
