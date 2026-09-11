@@ -21,7 +21,7 @@ from modeltool.adapters.onnx_adapter import (convert_onnx, inspect_onnx,
 from modeltool.adapters.pytorch_adapter import convert_pytorch
 from modeltool.adapters.tflite_adapter import inspect_tflite
 from modeltool.builders.arm64_tflite_builder import build_shared_library
-from modeltool.core.bundle import create_delivery_package, load_bundle
+from modeltool.core.bundle import create_delivery_package, load_bundle, validate_bundle_contract
 from modeltool.core.detector import detect_model_type
 from modeltool.core.errors import ModelToolError
 from modeltool.core.manifest import read_json, write_json
@@ -335,6 +335,7 @@ def cmd_build(args) -> None:
 def cmd_inspect_bundle(args) -> None:
     bundle = load_bundle(args.bundle)
     try:
+        contract = validate_bundle_contract(bundle)
         print(json.dumps({
             "status": "success",
             "bundle_id": bundle.manifest["bundle_id"],
@@ -344,6 +345,7 @@ def cmd_inspect_bundle(args) -> None:
             "model_profile": str(bundle.profile) if bundle.profile else None,
             "model_loader": str(bundle.loader) if bundle.loader else None,
             "reference_inputs": bundle.references,
+            "contract_validation": contract,
             "provenance": bundle.provenance(),
         }, indent=2))
     finally:
@@ -354,6 +356,7 @@ def cmd_build_package(args) -> None:
     """Build a validated bundle then create a compact deployable archive."""
     bundle = load_bundle(args.bundle)
     try:
+        contract = validate_bundle_contract(bundle)
         if args.reference_input and bundle.references:
             raise ModelToolError("BUNDLE_REFERENCE_AMBIGUOUS",
                                  "use reference_inputs in bundle.json or --reference-input, not both")
@@ -367,6 +370,7 @@ def cmd_build_package(args) -> None:
             args.output_dir = str(Path("dist") / bundle.manifest["bundle_id"])
         args.quiet = True
         build = cmd_build(args)
+        build["contract_validation"] = contract
         output = path(args.package_output) if args.package_output else \
             path(args.output_dir) / f"{bundle.manifest['bundle_id']}-{args.target}.tar.gz"
         if output.exists() and args.force:
@@ -374,7 +378,8 @@ def cmd_build_package(args) -> None:
         archive = create_delivery_package(bundle=bundle,
                                           build_root=path(args.output_dir), output=output)
         print(json.dumps({**build, "bundle_id": bundle.manifest["bundle_id"],
-                          "package": str(archive), "provenance": bundle.provenance()}, indent=2))
+                          "package": str(archive),
+                          "provenance": bundle.provenance()}, indent=2))
     finally:
         bundle.cleanup()
 

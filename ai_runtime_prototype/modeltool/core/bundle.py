@@ -16,6 +16,9 @@ from .errors import ModelToolError
 from .manifest import read_json, write_json
 
 
+_SUPPORTED_MODEL_SUFFIXES = {".tflite", ".onnx", ".pt", ".pth"}
+
+
 def _sha256(file: Path) -> str:
     digest = hashlib.sha256()
     with file.open("rb") as stream:
@@ -123,6 +126,20 @@ def load_bundle(value: str | Path) -> ModelBundle:
     model = optional_asset("model")
     if model is None:
         raise ModelToolError("BUNDLE_MANIFEST_INVALID", "bundle.json requires model")
+    if model.suffix.lower() not in _SUPPORTED_MODEL_SUFFIXES:
+        raise ModelToolError("BUNDLE_MANIFEST_INVALID",
+                             "model must end in one of: " + ", ".join(sorted(_SUPPORTED_MODEL_SUFFIXES)))
+    metadata = optional_asset("metadata")
+    if metadata:
+        try:
+            value = read_json(metadata)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ModelToolError("BUNDLE_METADATA_INVALID", f"cannot read metadata {metadata}: {error}") from error
+        if not isinstance(value, dict):
+            raise ModelToolError("BUNDLE_METADATA_INVALID", "metadata must contain a JSON object")
+    loader = optional_asset("model_loader")
+    if loader and model.suffix.lower() not in {".pt", ".pth"}:
+        raise ModelToolError("BUNDLE_MANIFEST_INVALID", "model_loader is only valid for .pt/.pth models")
     references: list[str] = []
     raw_references = manifest.get("reference_inputs", [])
     if not isinstance(raw_references, list):
@@ -141,9 +158,73 @@ def load_bundle(value: str | Path) -> ModelBundle:
             raise ModelToolError("BUNDLE_MANIFEST_INVALID", f"reference input must be .npy: {reference}")
         references.append(f"{name}={reference}")
 
-    return ModelBundle(root, manifest_path, manifest, model, optional_asset("metadata"),
-                       optional_asset("model_profile"), optional_asset("model_loader"),
+    return ModelBundle(root, manifest_path, manifest, model, metadata,
+                       optional_asset("model_profile"), loader,
                        references, temporary)
+
+
+def validate_bundle_contract(bundle: ModelBundle) -> dict[str, Any]:
+    """Validate profile structure and real reference tensors before conversion.
+
+    This deliberately checks only facts that can be established locally. Model
+    graph operators are inspected by the framework adapter later in the build.
+    """
+    if bundle.profile is None:
+        return {"status": "NOT_APPLICABLE", "reason": "bundle has no model_profile"}
+    try:
+        profile = read_json(bundle.profile)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ModelToolError("BUNDLE_PROFILE_INVALID",
+                             f"cannot read model profile {bundle.profile}: {error}") from error
+    if profile.get("schema_version") != 1:
+        raise ModelToolError("BUNDLE_PROFILE_INVALID", "model_profile schema_version must be 1")
+    inputs, outputs = profile.get("inputs"), profile.get("outputs")
+    if not isinstance(inputs, list) or not inputs or not isinstance(outputs, list) or not outputs:
+        raise ModelToolError("BUNDLE_PROFILE_INVALID", "model_profile requires non-empty inputs and outputs")
+    supported_dtypes = {"float32", "int32"}
+    seen_names: set[str] = set()
+    for index, item in enumerate(inputs + outputs):
+        group = "inputs" if index < len(inputs) else "outputs"
+        local_index = index if group == "inputs" else index - len(inputs)
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise ModelToolError("BUNDLE_PROFILE_INVALID", f"{group}[{local_index}] needs a name")
+        if item["name"] in seen_names:
+            raise ModelToolError("BUNDLE_PROFILE_INVALID", f"duplicate tensor name: {item['name']}")
+        seen_names.add(item["name"])
+        if item.get("dtype") not in supported_dtypes:
+            raise ModelToolError("BUNDLE_PROFILE_INVALID",
+                                 f"{group}[{local_index}] has unsupported dtype {item.get('dtype')!r}")
+        shape = item.get("shape")
+        if not isinstance(shape, list) or not shape or not all(isinstance(size, int) and size > 0 for size in shape):
+            raise ModelToolError("BUNDLE_PROFILE_INVALID", f"{group}[{local_index}] needs a static positive shape")
+
+    if not bundle.references:
+        return {
+            "status": "WARNING",
+            "profile": str(bundle.profile),
+            "reference_inputs": "not supplied",
+            "message": "No golden input tensors: framework/TFLite parity cannot be representative. "
+                       "Use --allow-synthetic-validation only for smoke tests.",
+        }
+    try:
+        import numpy as np
+    except ImportError as error:
+        raise ModelToolError("BUNDLE_REFERENCE_INVALID", "numpy is required to validate .npy references") from error
+    references = dict(item.split("=", 1) for item in bundle.references)
+    expected_names = [item["name"] for item in inputs]
+    if set(references) != set(expected_names):
+        raise ModelToolError("BUNDLE_REFERENCE_CONTRACT_MISMATCH",
+                             f"reference names differ: expected={expected_names}, got={sorted(references)}")
+    for item in inputs:
+        tensor = np.load(references[item["name"]], allow_pickle=False)
+        actual_dtype, actual_shape = np.dtype(tensor.dtype).name, list(tensor.shape)
+        if actual_dtype != item["dtype"] or actual_shape != item["shape"]:
+            raise ModelToolError(
+                "BUNDLE_REFERENCE_CONTRACT_MISMATCH",
+                f"reference {item['name']!r}: expected dtype={item['dtype']} shape={item['shape']}, "
+                f"got dtype={actual_dtype} shape={actual_shape}",
+            )
+    return {"status": "PASS", "profile": str(bundle.profile), "reference_inputs": expected_names}
 
 
 def create_delivery_package(*, bundle: ModelBundle, build_root: Path, output: Path) -> Path:

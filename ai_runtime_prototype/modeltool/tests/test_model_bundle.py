@@ -6,9 +6,11 @@ import unittest
 from pathlib import Path
 from zipfile import ZipFile
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from modeltool.core.bundle import create_delivery_package, load_bundle
+from modeltool.core.bundle import create_delivery_package, load_bundle, validate_bundle_contract
 from modeltool.core.errors import ModelToolError
 
 
@@ -33,6 +35,22 @@ class ModelBundleTest(unittest.TestCase):
             self.assertEqual("example-v1", bundle.manifest["bundle_id"])
             self.assertEqual([f"input={root / 'reference' / 'input.npy'}"], bundle.references)
             self.assertEqual(64, len(bundle.provenance()["assets_sha256"]["model"]))
+
+    def test_missing_references_are_warning_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_bundle(root)
+            (root / "contract").mkdir()
+            (root / "contract" / "profile.json").write_text(json.dumps({
+                "schema_version": 1,
+                "inputs": [{"name": "input", "dtype": "float32", "shape": [1, 2]}],
+                "outputs": [{"name": "output", "dtype": "float32", "shape": [1, 1]}],
+            }), encoding="utf-8")
+            manifest = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
+            manifest["model_profile"] = "contract/profile.json"
+            manifest.pop("reference_inputs")
+            (root / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertEqual("WARNING", validate_bundle_contract(load_bundle(root))["status"])
 
     def test_zip_bundle_with_wrapper_directory_is_resolved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -59,6 +77,27 @@ class ModelBundleTest(unittest.TestCase):
             with self.assertRaises(ModelToolError) as context:
                 load_bundle(root)
             self.assertEqual("BUNDLE_PATH_INVALID", context.exception.code)
+
+    def test_reference_tensors_must_match_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_bundle(root)
+            (root / "contract").mkdir()
+            (root / "contract" / "profile.json").write_text(json.dumps({
+                "schema_version": 1,
+                "inputs": [{"name": "input", "dtype": "float32", "shape": [1, 2]}],
+                "outputs": [{"name": "output", "dtype": "float32", "shape": [1, 1]}],
+            }), encoding="utf-8")
+            np.save(root / "reference" / "input.npy", np.zeros((1, 2), dtype=np.float32))
+            manifest = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
+            manifest["model_profile"] = "contract/profile.json"
+            (root / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+            bundle = load_bundle(root)
+            self.assertEqual("PASS", validate_bundle_contract(bundle)["status"])
+            np.save(root / "reference" / "input.npy", np.zeros((1, 3), dtype=np.float32))
+            with self.assertRaises(ModelToolError) as context:
+                validate_bundle_contract(bundle)
+            self.assertEqual("BUNDLE_REFERENCE_CONTRACT_MISMATCH", context.exception.code)
 
     def test_delivery_package_contains_headers_and_not_source_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
