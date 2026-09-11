@@ -2,6 +2,15 @@
   "schema_version": 1,
   "model_id": "tinygru-p16-v1",
   "preprocessing": "tinygru_p16_v1",
+  "windowing": {
+    "skip_packets": 10,
+    "window_size": 90,
+    "stride": 90
+  },
+  "postprocessing": {
+    "softmax_temperature": 1.0,
+    "accept_threshold": 0.0
+  },
   "inputs": [
     {
       "name": "numeric",

@@ -57,9 +57,12 @@ typedef struct {
 } traffic_p16_config_t;
 
 typedef struct {
+    /* Raw model logits in deployment class order. */
     float scores[TRAFFIC_P16_CLASS_COUNT];
     int label;
     double latency_ms;
+    float confidence;
+    int accepted;
 } traffic_p16_result_t;
 
 /* Implements exactly the P16 training contract:
@@ -69,8 +72,8 @@ typedef struct {
  * p16_ids[:]    = vocabulary ID of the global-unicast remote IPv4 /16,
  *                  or zero (UNK).
  *
- * The application passes the post-skip 90-packet window. Therefore with
- * SKIP_PACKETS=10, its first entry is original flow packet 11. */
+ * The application passes the post-skip 90-packet window. Query
+ * traffic_ai_skip_packets() instead of hard-coding the model's skip policy. */
 int traffic_p16_prepare_packets(const traffic_p16_packet_t *packets,
                                 size_t packet_count,
                                 const traffic_p16_config_t *config,
@@ -78,8 +81,7 @@ int traffic_p16_prepare_packets(const traffic_p16_packet_t *packets,
                                 int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE]);
 
 /* remote_global_ipv4 is host-order and is applied to every packet in this
- * window. It must be global-unicast; an unlisted /16 still maps to ID 0
- * (UNK), matching the trained model contract. */
+ * window. A non-global or unlisted /16 maps to ID 0 (UNK). */
 int traffic_p16_prepare_directional_packets(
     const traffic_p16_directional_packet_t *packets, size_t packet_count,
     uint32_t remote_global_ipv4, const traffic_p16_config_t *config,

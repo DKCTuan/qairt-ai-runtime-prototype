@@ -39,20 +39,32 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
 
-    metadata = json.loads(args.metadata.read_text(encoding="utf-8"))
+    document = json.loads(args.metadata.read_text(encoding="utf-8"))
+    # Older artifacts use a flat model_metadata.json. New training notebooks
+    # emit deployment_contract.json with model_config nested inside it.
+    metadata = document.get("model_config", document)
     if metadata.get("window_size") != WINDOW or metadata.get("stride") != WINDOW:
         fail("metadata must specify window_size=stride=90")
-    if metadata.get("skip_packets") != 10:
-        fail("metadata must specify skip_packets=10")
-    if metadata.get("input_numeric_shape") != [1, WINDOW, 3]:
+    skip_packets = metadata.get("skip_packets")
+    if not isinstance(skip_packets, int) or skip_packets < 0:
+        fail("metadata must specify a non-negative skip_packets")
+    numeric_shape = metadata.get("input_numeric_shape", [1, WINDOW, 3])
+    p16_shape = metadata.get("input_p16_shape", [1, WINDOW])
+    if numeric_shape != [1, WINDOW, 3]:
         fail("input_numeric_shape must be [1,90,3]")
-    if metadata.get("input_p16_shape") != [1, WINDOW]:
+    if p16_shape != [1, WINDOW]:
         fail("input_p16_shape must be [1,90]")
-    if metadata.get("numeric_features") != [
-        "log1p(packet_length)", "log1p(nonnegative_iat)", "direction",
-    ]:
+    expected_features = [
+        "log1p_packet_length", "log1p_nonnegative_iat", "direction",
+    ]
+    raw_features = metadata.get("numeric_features")
+    if raw_features is None:
+        raw_features = document.get("preprocessing", {}).get("feature_order")
+    canonical_features = [str(value).replace("(", "_").replace(")", "")
+                          for value in (raw_features or [])]
+    if canonical_features != expected_features:
         fail("numeric feature order differs from the P16 deployment contract")
-    classes = metadata.get("classes")
+    classes = document.get("classes", metadata.get("classes"))
     if not isinstance(classes, list) or len(classes) != 5 or not all(isinstance(x, str) for x in classes):
         fail("metadata must contain exactly five class names")
     model_profile_path = args.output_dir / "model_profile.json"
@@ -61,8 +73,9 @@ def main() -> None:
             model_profile = json.loads(model_profile_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             fail(f"cannot read matching model profile: {error}")
-        if model_profile.get("preprocessing") != "tinygru_p16_v1":
-            fail("model profile does not select the tinygru_p16_v1 adapter")
+        preprocessing = model_profile.get("preprocessing")
+        if not isinstance(preprocessing, str) or not preprocessing.startswith("tinygru_p16_"):
+            fail("model profile does not select a TinyGRU P16 adapter")
         if model_profile.get("classes") != classes:
             fail("model profile class order differs from training metadata")
         if model_profile.get("inputs") != [
@@ -75,14 +88,16 @@ def main() -> None:
         ]:
             fail("model profile output differs from the P16 deployment contract")
     p16 = metadata.get("p16", {})
-    if p16.get("unk_id") != 0 or p16.get("embedding_dim") != 8:
-        fail("P16 metadata must use embedding_dim=8 and unk_id=0")
-    vocab_size = p16.get("vocab_size_including_unk")
+    unk_id = p16.get("unk_id", 0)
+    embedding_dim = p16.get("embedding_dim", metadata.get("p16_emb_dim"))
+    if unk_id != 0 or not isinstance(embedding_dim, int) or embedding_dim < 1:
+        fail("P16 metadata must use unk_id=0 and a positive embedding dimension")
+    vocab_size = p16.get("vocab_size_including_unk", document.get("p16_vocab_size"))
     if not isinstance(vocab_size, int) or vocab_size < 1:
         fail("invalid p16 vocabulary size")
 
     rows = list(csv.DictReader(args.normalization.open(encoding="utf-8", newline="")))
-    if [row.get("feature") for row in rows] != list(CHANNELS):
+    if [(row.get("feature") or row.get("feature_name")) for row in rows] != list(CHANNELS):
         fail("normalization.csv channels are missing or in the wrong order")
     means = [finite_float(row.get("mean"), f"mean[{i}]") for i, row in enumerate(rows)]
     stds = [finite_float(row.get("std"), f"std[{i}]") for i, row in enumerate(rows)]
@@ -101,8 +116,8 @@ def main() -> None:
     seen_prefixes, seen_ids = set(), set()
     for row in csv.DictReader(args.vocabulary.open(encoding="utf-8", newline="")):
         try:
-            network = ipaddress.ip_network(row["prefix"], strict=True)
-            embedding_id = int(row["embedding_id"])
+            network = ipaddress.ip_network(row.get("prefix") or row["prefix16"], strict=True)
+            embedding_id = int(row.get("embedding_id") or row["local_id"])
         except (KeyError, ValueError) as exc:
             fail(f"invalid vocabulary row: {exc}")
         if network.version != 4 or network.prefixlen != 16:

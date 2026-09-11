@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "model_id": "tinygru-p16-h48x2-cap025-v1",
+  "preprocessing": "tinygru_p16_h48x2_cap025_v1",
+  "architecture": {
+    "fusion": "late",
+    "hidden_size": 48,
+    "num_layers": 2,
+    "p16_embedding_dim": 2,
+    "ip_logit_cap": 0.25
+  },
+  "windowing": {
+    "skip_packets": 0,
+    "window_size": 90,
+    "stride": 90
+  },
+  "postprocessing": {
+    "softmax_temperature": 1.0,
+    "accept_threshold": 0.98
+  },
+  "inputs": [
+    {"name": "numeric", "dtype": "float32", "shape": [1, 90, 3]},
+    {"name": "p16_ids", "dtype": "int32", "shape": [1, 90]}
+  ],
+  "outputs": [
+    {"name": "logits", "dtype": "float32", "shape": [1, 5]}
+  ],
+  "classes": ["Background", "Game", "RTVideo", "Voice", "VStream"]
+}

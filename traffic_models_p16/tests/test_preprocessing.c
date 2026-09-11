@@ -32,10 +32,11 @@ int main(void)
     assert(traffic_p16_prepare_packets(packets, TRAFFIC_P16_WINDOW_SIZE, &config,
                                        numeric, ids) == TRAFFIC_P16_OK);
     assert(ids[1] == 17 && numeric[5] == -1.0f);
-    packets[1].timestamp_us = packets[0].timestamp_us - 1;
+    packets[2].timestamp_us = packets[1].timestamp_us - 1;
     assert(traffic_p16_prepare_packets(packets, TRAFFIC_P16_WINDOW_SIZE, &config,
-                                       numeric, ids) == TRAFFIC_P16_INVALID_INPUT);
-    packets[1].timestamp_us = 2000000;
+                                       numeric, ids) == TRAFFIC_P16_OK);
+    assert(fabsf(numeric[7] - ((log1pf(0.0f) - 2.0f) / 4.0f)) < 1e-6f);
+    packets[2].timestamp_us = 4000000;
     packets[1].source_ipv4 = 0x64400001U; /* 100.64.0.1 is neither private nor global. */
     packets[1].destination_ipv4 = 0x14ca327bU;
     assert(traffic_p16_prepare_packets(packets, TRAFFIC_P16_WINDOW_SIZE, &config,
@@ -65,7 +66,8 @@ int main(void)
     directional[1].direction = -1;
     assert(traffic_p16_prepare_directional_packets(
                directional, TRAFFIC_P16_WINDOW_SIZE, 0x64400001U, &config,
-               numeric, ids) == TRAFFIC_P16_INVALID_INPUT);
+               numeric, ids) == TRAFFIC_P16_OK);
+    assert(ids[0] == 0 && ids[89] == 0);
     assert(strcmp(traffic_p16_class_name(3), "Voice") == 0);
     assert(strcmp(traffic_p16_class_name(4), "VStream") == 0);
     return 0;

@@ -83,9 +83,6 @@ int traffic_p16_prepare_packets(const traffic_p16_packet_t *packets,
         float iat_seconds;
         float values[TRAFFIC_P16_NUMERIC_CHANNELS];
 
-        if (i != 0 && packets[i].timestamp_us < packets[i - 1].timestamp_us)
-            return TRAFFIC_P16_INVALID_INPUT;
-
         if (src_local && ipv4_global_unicast(packets[i].destination_ipv4)) {
             remote = packets[i].destination_ipv4;
             direction = 1.0f;
@@ -100,9 +97,9 @@ int traffic_p16_prepare_packets(const traffic_p16_packet_t *packets,
             direction = 1.0f;
         }
 
-        iat_seconds = i == 0 ? 0.0f :
-            (float)((packets[i].timestamp_us - packets[i - 1].timestamp_us) / 1000000.0);
-        if (iat_seconds < 0.0f) iat_seconds = 0.0f;
+        iat_seconds = i == 0 || packets[i].timestamp_us < packets[i - 1].timestamp_us ?
+            0.0f : (float)((packets[i].timestamp_us - packets[i - 1].timestamp_us) /
+                           1000000.0);
         values[0] = log1pf((float)packets[i].packet_length);
         values[1] = log1pf(iat_seconds);
         values[2] = direction;
@@ -123,19 +120,19 @@ int traffic_p16_prepare_directional_packets(
     int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE])
 {
     if (packets == NULL || numeric == NULL || p16_ids == NULL ||
-        packet_count != TRAFFIC_P16_WINDOW_SIZE || !valid_config(config) ||
-        !ipv4_global_unicast(remote_global_ipv4))
+        packet_count != TRAFFIC_P16_WINDOW_SIZE || !valid_config(config))
         return TRAFFIC_P16_INVALID_INPUT;
 
-    int32_t p16_id = lookup_prefix16(config, (uint16_t)(remote_global_ipv4 >> 16));
+    int32_t p16_id = ipv4_global_unicast(remote_global_ipv4) ?
+        lookup_prefix16(config, (uint16_t)(remote_global_ipv4 >> 16)) : 0;
     for (size_t i = 0; i < packet_count; ++i) {
         float values[TRAFFIC_P16_NUMERIC_CHANNELS];
         float iat_seconds;
-        if ((i != 0 && packets[i].timestamp_us < packets[i - 1].timestamp_us) ||
-            (packets[i].direction != -1 && packets[i].direction != 1))
+        if (packets[i].direction != -1 && packets[i].direction != 1)
             return TRAFFIC_P16_INVALID_INPUT;
-        iat_seconds = i == 0 ? 0.0f :
-            (float)((packets[i].timestamp_us - packets[i - 1].timestamp_us) / 1000000.0);
+        iat_seconds = i == 0 || packets[i].timestamp_us < packets[i - 1].timestamp_us ?
+            0.0f : (float)((packets[i].timestamp_us - packets[i - 1].timestamp_us) /
+                           1000000.0);
         values[0] = log1pf((float)packets[i].packet_length);
         values[1] = log1pf(iat_seconds);
         values[2] = (float)packets[i].direction;
@@ -152,7 +149,7 @@ int traffic_p16_prepare_directional_packets(
 int traffic_p16_model_init(void)
 {
     const traffic_model_contract_t *contract = &traffic_model_profile_contract;
-    if (strcmp(contract->preprocessing_id, "tinygru_p16_v1") != 0 ||
+    if (strncmp(contract->preprocessing_id, "tinygru_p16_", 12) != 0 ||
         contract->input_count != 2 || contract->output_count != 1 ||
         contract->inputs[0].dtype != TRAFFIC_MODEL_DTYPE_FLOAT32 ||
         contract->inputs[0].element_count != TRAFFIC_P16_NUMERIC_ELEMENTS ||
@@ -178,6 +175,7 @@ int traffic_p16_predict(const float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS],
                         const int32_t p16_ids[TRAFFIC_P16_WINDOW_SIZE],
                         traffic_p16_result_t *result)
 {
+    const traffic_model_contract_t *contract = &traffic_model_profile_contract;
     if (numeric == NULL || p16_ids == NULL || result == NULL) return TRAFFIC_P16_INVALID_INPUT;
     memset(result, 0, sizeof(*result));
     result->label = -1;
@@ -195,8 +193,17 @@ int traffic_p16_predict(const float numeric[TRAFFIC_P16_NUMERIC_ELEMENTS],
     if (status != TRAFFIC_MODEL_RUNTIME_OK)
         return TRAFFIC_P16_INFERENCE_ERROR;
     result->label = 0;
+    for (int i = 0; i < TRAFFIC_P16_CLASS_COUNT; ++i)
+        if (!isfinite(result->scores[i])) return TRAFFIC_P16_INFERENCE_ERROR;
     for (int i = 1; i < TRAFFIC_P16_CLASS_COUNT; ++i)
         if (result->scores[i] > result->scores[result->label]) result->label = i;
+    float maximum = result->scores[result->label];
+    float denominator = 0.0f;
+    for (int i = 0; i < TRAFFIC_P16_CLASS_COUNT; ++i)
+        denominator += expf((result->scores[i] - maximum) /
+                            contract->softmax_temperature);
+    result->confidence = 1.0f / denominator;
+    result->accepted = result->confidence >= contract->accept_threshold;
     return TRAFFIC_P16_OK;
 }
 

@@ -30,6 +30,8 @@ int traffic_rf_extract(const uint64_t *timestamp_us, const uint32_t *packet_size
 const traffic_model_contract_t *traffic_ai_model_contract(void);
 const char *traffic_ai_model_id(void);
 const char *traffic_ai_preprocessing_id(void);
+size_t traffic_ai_skip_packets(void);
+float traffic_ai_accept_threshold(void);
 
 #include "traffic_p16.h"
 #include "traffic_p16_deployment_config.h"

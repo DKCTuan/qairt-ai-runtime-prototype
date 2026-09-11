@@ -1,8 +1,9 @@
-"""Trusted loader for the TinyGRU P16 final training checkpoint.
+"""Trusted loader for TinyGRU P16 training or inference checkpoints.
 
 Use with ``modeltool --model-loader``. The architecture dimensions are
-derived from the saved weights; only the training-only ``pair_classifier``
-head is intentionally omitted from the inference graph.
+derived from the saved weights. Both the original early-fusion model and the
+H48x2 capped late-fusion model are supported; training-only auxiliary heads
+are intentionally omitted from the inference graph.
 """
 
 
@@ -26,13 +27,11 @@ def load_model(checkpoint_path: str, *, trust_pickle: bool = False):
     if not isinstance(state, dict):
         raise ValueError("checkpoint has no model_state_dict")
 
+    late_fusion = "ip_to_logits.weight" in state
+    head = "traffic_head" if late_fusion else "classifier"
     required = (
-        "p16_embedding.weight",
-        "gru.weight_ih_l0",
-        "gru.weight_hh_l0",
-        "classifier.0.weight",
-        "classifier.1.weight",
-        "classifier.4.weight",
+        "p16_embedding.weight", "gru.weight_ih_l0", "gru.weight_hh_l0",
+        f"{head}.0.weight", f"{head}.1.weight", f"{head}.4.weight",
     )
     missing = [name for name in required if name not in state]
     if missing:
@@ -40,9 +39,9 @@ def load_model(checkpoint_path: str, *, trust_pickle: bool = False):
 
     vocab_size, embedding_dim = state["p16_embedding.weight"].shape
     hidden_size = state["gru.weight_hh_l0"].shape[1]
-    combined_input_size = state["gru.weight_ih_l0"].shape[1]
-    numeric_size = combined_input_size - embedding_dim
-    num_classes = state["classifier.4.weight"].shape[0]
+    gru_input_size = state["gru.weight_ih_l0"].shape[1]
+    numeric_size = gru_input_size if late_fusion else gru_input_size - embedding_dim
+    num_classes = state[f"{head}.4.weight"].shape[0]
     num_layers = len([
         name for name in state
         if name.startswith("gru.weight_ih_l") and "reverse" not in name
@@ -50,12 +49,26 @@ def load_model(checkpoint_path: str, *, trust_pickle: bool = False):
     if numeric_size <= 0 or num_layers <= 0:
         raise ValueError("invalid GRU dimensions in checkpoint")
 
-    class TinyGRUP16Inference(torch.nn.Module):
+    if late_fusion:
+        required_late = ("ip_to_logits.weight",)
+        missing_late = [name for name in required_late if name not in state]
+        if missing_late:
+            raise ValueError("late-fusion checkpoint is missing: " + ", ".join(missing_late))
+        config = checkpoint.get("config", {})
+        if not isinstance(config, dict) or "ip_logit_cap" not in config:
+            raise ValueError("late-fusion checkpoint config must contain ip_logit_cap")
+        ip_logit_cap = float(config["ip_logit_cap"])
+        if not 0.0 <= ip_logit_cap <= 1.0:
+            raise ValueError("ip_logit_cap must be in [0, 1]")
+        if state["ip_to_logits.weight"].shape != (num_classes, embedding_dim):
+            raise ValueError("ip_to_logits dimensions do not match the checkpoint")
+
+    class TinyGRUP16EarlyFusionInference(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.p16_embedding = torch.nn.Embedding(vocab_size, embedding_dim)
             self.gru = torch.nn.GRU(
-                input_size=combined_input_size,
+                input_size=gru_input_size,
                 hidden_size=hidden_size,
                 num_layers=num_layers,
                 batch_first=True,
@@ -76,11 +89,43 @@ def load_model(checkpoint_path: str, *, trust_pickle: bool = False):
             _, hidden = self.gru(sequence)
             return self.classifier(hidden[-1])
 
-    model = TinyGRUP16Inference()
-    inference_state = {
-        name: value for name, value in state.items()
-        if not name.startswith("pair_classifier.")
-    }
+    class TinyGRUP16LateFusionInference(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gru = torch.nn.GRU(
+                input_size=numeric_size, hidden_size=hidden_size,
+                num_layers=num_layers, batch_first=True,
+                bidirectional=False, dropout=0.0,
+            )
+            self.traffic_head = torch.nn.Sequential(
+                torch.nn.LayerNorm(hidden_size),
+                torch.nn.Linear(hidden_size, hidden_size),
+                torch.nn.ReLU(), torch.nn.Dropout(0.0),
+                torch.nn.Linear(hidden_size, num_classes),
+            )
+            self.p16_embedding = torch.nn.Embedding(
+                vocab_size, embedding_dim, padding_idx=0
+            )
+            self.ip_to_logits = torch.nn.Linear(
+                embedding_dim, num_classes, bias=False
+            )
+
+        def forward(self, numeric, p16_ids):
+            _, hidden = self.gru(numeric)
+            traffic_logits = self.traffic_head(hidden[-1])
+            embedded = self.p16_embedding(p16_ids)
+            valid = (p16_ids != 0).unsqueeze(-1).to(embedded.dtype)
+            pooled = (embedded * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+            ip_delta = ip_logit_cap * torch.tanh(self.ip_to_logits(pooled))
+            return traffic_logits + ip_delta
+
+    model = (TinyGRUP16LateFusionInference() if late_fusion
+             else TinyGRUP16EarlyFusionInference())
+    ignored_prefixes = (
+        "pair_classifier.", "rtvideo_voice_head.", "bg_vstream_head."
+    )
+    inference_state = {name: value for name, value in state.items()
+                       if not name.startswith(ignored_prefixes)}
     result = model.load_state_dict(inference_state, strict=False)
     if result.missing_keys or result.unexpected_keys:
         raise ValueError(

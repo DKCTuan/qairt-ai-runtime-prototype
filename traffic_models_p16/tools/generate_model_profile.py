@@ -18,6 +18,13 @@ def c_string(value):
     return json.dumps(value, ensure_ascii=True)
 
 
+def c_float(value):
+    text = format(float(value), ".9g")
+    if "." not in text and "e" not in text.lower():
+        text += ".0"
+    return text + "f"
+
+
 def tensor(item, location):
     if not isinstance(item, dict):
         fail(location + " must be an object")
@@ -62,6 +69,19 @@ def main():
         fail("classes must be an array of non-empty strings")
     if classes and outputs[0][2] != len(classes):
         fail("the first output element count must match classes")
+    windowing = profile.get("windowing", {})
+    skip_packets = windowing.get("skip_packets", 0)
+    if not isinstance(skip_packets, int) or skip_packets < 0:
+        fail("windowing.skip_packets must be a non-negative integer")
+    postprocessing = profile.get("postprocessing", {})
+    temperature = postprocessing.get("softmax_temperature", 1.0)
+    threshold = postprocessing.get("accept_threshold", 0.0)
+    if (not isinstance(temperature, (int, float)) or not math.isfinite(temperature)
+            or temperature <= 0.0):
+        fail("postprocessing.softmax_temperature must be positive and finite")
+    if (not isinstance(threshold, (int, float)) or not math.isfinite(threshold)
+            or threshold < 0.0 or threshold > 1.0):
+        fail("postprocessing.accept_threshold must be in [0,1]")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     header = args.output_dir / "traffic_model_profile.h"
@@ -87,7 +107,10 @@ def main():
         "const traffic_model_contract_t traffic_model_profile_contract = {\n"
         "    %s, %s,\n" % (c_string(model_id), c_string(preprocessing)) +
         "    profile_inputs, %d, profile_outputs, %d,\n" % (len(inputs), len(outputs)) +
-        "    profile_classes, %d\n};\n" % len(classes), encoding="utf-8")
+        "    profile_classes, %d,\n" % len(classes) +
+        "    %d, %s, %s\n};\n" %
+        (skip_packets, c_float(temperature), c_float(threshold)),
+        encoding="utf-8")
     print("status=success")
     print("model_id=" + model_id)
     print("preprocessing=" + preprocessing)

@@ -5,7 +5,9 @@
     traffic_rf_extract;
     traffic_ai_model_contract;
     traffic_ai_model_id;
-    traffic_ai_preprocessing_id;
+        traffic_ai_preprocessing_id;
+        traffic_ai_skip_packets;
+        traffic_ai_accept_threshold;
     traffic_p16_prepare_packets;
     traffic_p16_prepare_directional_packets;
     traffic_p16_model_init;

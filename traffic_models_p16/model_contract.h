@@ -27,6 +27,9 @@ typedef struct {
     size_t output_count;
     const char *const *class_names;
     size_t class_count;
+    size_t skip_packets;
+    float softmax_temperature;
+    float accept_threshold;
 } traffic_model_contract_t;
 
 #ifdef __cplusplus
