@@ -1,0 +1,87 @@
+import json
+import sys
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+from zipfile import ZipFile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from modeltool.core.bundle import create_delivery_package, load_bundle
+from modeltool.core.errors import ModelToolError
+
+
+class ModelBundleTest(unittest.TestCase):
+    def write_bundle(self, root: Path) -> None:
+        (root / "model").mkdir()
+        (root / "reference").mkdir()
+        (root / "model" / "example.tflite").write_bytes(b"tflite")
+        (root / "reference" / "input.npy").write_bytes(b"npy")
+        (root / "bundle.json").write_text(json.dumps({
+            "schema_version": 1,
+            "bundle_id": "example-v1",
+            "model": "model/example.tflite",
+            "reference_inputs": [{"name": "input", "path": "reference/input.npy"}],
+        }), encoding="utf-8")
+
+    def test_directory_bundle_is_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_bundle(root)
+            bundle = load_bundle(root)
+            self.assertEqual("example-v1", bundle.manifest["bundle_id"])
+            self.assertEqual([f"input={root / 'reference' / 'input.npy'}"], bundle.references)
+            self.assertEqual(64, len(bundle.provenance()["assets_sha256"]["model"]))
+
+    def test_zip_bundle_with_wrapper_directory_is_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "wrapped"
+            root.mkdir()
+            self.write_bundle(root)
+            archive = Path(directory) / "bundle.zip"
+            with ZipFile(archive, "w") as output:
+                for file in root.rglob("*"):
+                    if file.is_file():
+                        output.write(file, file.relative_to(root.parent))
+            bundle = load_bundle(archive)
+            try:
+                self.assertEqual("example-v1", bundle.manifest["bundle_id"])
+            finally:
+                bundle.cleanup()
+
+    def test_assets_cannot_escape_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "bundle.json").write_text(json.dumps({
+                "schema_version": 1, "bundle_id": "bad", "model": "../outside.tflite",
+            }), encoding="utf-8")
+            with self.assertRaises(ModelToolError) as context:
+                load_bundle(root)
+            self.assertEqual("BUNDLE_PATH_INVALID", context.exception.code)
+
+    def test_delivery_package_contains_headers_and_not_source_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "bundle"
+            root.mkdir()
+            self.write_bundle(root)
+            bundle = load_bundle(root)
+            build = Path(directory) / "build"
+            (build / "converted").mkdir(parents=True)
+            (build / "arm64").mkdir()
+            (build / "converted" / "model_float32.tflite").write_bytes(b"converted")
+            (build / "arm64" / "libexample.so").write_bytes(b"library")
+            (build / "arm64" / "ai_model.h").write_text("/* header */\n", encoding="utf-8")
+            (build / "manifest.json").write_text("{}\n", encoding="utf-8")
+            (build / "validation_report.json").write_text("{}\n", encoding="utf-8")
+            archive = create_delivery_package(bundle=bundle, build_root=build,
+                                              output=Path(directory) / "delivery.tar.gz")
+            with tarfile.open(archive, "r:gz") as contents:
+                names = contents.getnames()
+            self.assertTrue(any(name.endswith("/include/ai_model.h") for name in names))
+            self.assertTrue(any(name.endswith("/lib/libexample.so") for name in names))
+            self.assertFalse(any(name.endswith("example.tflite") and "/source/" in name for name in names))
+
+
+if __name__ == "__main__":
+    unittest.main()

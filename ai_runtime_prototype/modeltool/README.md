@@ -12,11 +12,50 @@ python3 ai_runtime_prototype/modeltool/modeltool.py inspect MODEL
 python3 ai_runtime_prototype/modeltool/modeltool.py convert MODEL --output model.tflite
 python3 ai_runtime_prototype/modeltool/modeltool.py validate MODEL --tflite model.tflite --output validation.json
 python3 ai_runtime_prototype/modeltool/modeltool.py build MODEL --target arm64 --output-dir dist/MODEL_NAME
+python3 ai_runtime_prototype/modeltool/modeltool.py inspect-bundle MODEL_BUNDLE.zip
+python3 ai_runtime_prototype/modeltool/modeltool.py build-package MODEL_BUNDLE.zip --target arm64
 ```
 
 Supported input suffixes are `.tflite`, `.onnx`, `.pt` and `.pth`.  A suffix
 only selects the adapter; it is not a claim that every model of that framework
 can be converted.
+
+## Portable model bundles
+
+`build-package` is the preferred handoff path for a new model. A bundle is a
+directory or ZIP with a root `bundle.json`; its paths must be relative to the
+bundle so the conversion is reproducible on another build host. Start from
+[`examples/bundle.json.example`](examples/bundle.json.example):
+
+```text
+my-model/
+├── bundle.json
+├── model/model.pt              # .pt, .pth, .onnx, or .tflite
+├── contract/model_profile.json # optional but recommended tensor contract
+├── contract/preprocessing.json # optional preprocessing metadata
+├── loader/model_loader.py      # required for a state_dict-only checkpoint
+└── reference/*.npy             # real tensors for source/TFLite parity
+```
+
+For example, a trusted multi-input PyTorch bundle can be built as follows:
+
+```bash
+python3 ai_runtime_prototype/modeltool/modeltool.py build-package my-model.zip \
+  --target arm64 --target-libc musl \
+  --trust-pytorch-pickle \
+  --tensorflow-root "$TF_ROOT" \
+  --aarch64-toolchain "$TOOLCHAIN_REPO" \
+  --aarch64-compiler "$ARM64_CC" \
+  --aarch64-toolchain-config "$BAZEL_CONFIG" \
+  --aarch64-staging-dir "$STAGING_DIR" \
+  --output-dir dist/my-model --force
+```
+
+It validates the manifest and bundle-contained assets before conversion, then
+creates a deployable `.tar.gz` containing the converted TFLite, ARM64 library,
+generated C headers, profile/metadata, reports, provenance hashes and
+`SHA256SUMS`. Source checkpoints and Python loaders are intentionally omitted
+from the delivery archive.
 
 ## Artifact layout
 

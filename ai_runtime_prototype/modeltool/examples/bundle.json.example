@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "bundle_id": "my-model-v1",
+  "model": "model/model.pt",
+  "model_profile": "contract/model_profile.json",
+  "metadata": "contract/preprocessing.json",
+  "model_loader": "loader/model_loader.py",
+  "reference_inputs": [
+    {"name": "numeric", "path": "reference/numeric.npy"},
+    {"name": "category_ids", "path": "reference/category_ids.npy"}
+  ]
+}

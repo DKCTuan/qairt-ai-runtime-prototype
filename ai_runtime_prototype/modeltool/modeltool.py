@@ -21,6 +21,7 @@ from modeltool.adapters.onnx_adapter import (convert_onnx, inspect_onnx,
 from modeltool.adapters.pytorch_adapter import convert_pytorch
 from modeltool.adapters.tflite_adapter import inspect_tflite
 from modeltool.builders.arm64_tflite_builder import build_shared_library
+from modeltool.core.bundle import create_delivery_package, load_bundle
 from modeltool.core.detector import detect_model_type
 from modeltool.core.errors import ModelToolError
 from modeltool.core.manifest import read_json, write_json
@@ -323,10 +324,59 @@ def cmd_build(args) -> None:
     elf = inspect_shared_library(library, target_libc=args.target_libc,
                                  target_glibc=args.target_glibc)
     write_json(arm64_dir / "elf_report.json", elf)
-    print(json.dumps({"status": "success", "artifact_dir": str(root),
-                      "library": str(library), "manifest": str(root / "manifest.json"),
-                      "validation_report": str(root / "validation_report.json"),
-                      "elf": elf}, indent=2))
+    result = {"status": "success", "artifact_dir": str(root),
+              "library": str(library), "manifest": str(root / "manifest.json"),
+              "validation_report": str(root / "validation_report.json"), "elf": elf}
+    if not getattr(args, "quiet", False):
+        print(json.dumps(result, indent=2))
+    return result
+
+
+def cmd_inspect_bundle(args) -> None:
+    bundle = load_bundle(args.bundle)
+    try:
+        print(json.dumps({
+            "status": "success",
+            "bundle_id": bundle.manifest["bundle_id"],
+            "bundle_root": str(bundle.root),
+            "model": str(bundle.model),
+            "metadata": str(bundle.metadata) if bundle.metadata else None,
+            "model_profile": str(bundle.profile) if bundle.profile else None,
+            "model_loader": str(bundle.loader) if bundle.loader else None,
+            "reference_inputs": bundle.references,
+            "provenance": bundle.provenance(),
+        }, indent=2))
+    finally:
+        bundle.cleanup()
+
+
+def cmd_build_package(args) -> None:
+    """Build a validated bundle then create a compact deployable archive."""
+    bundle = load_bundle(args.bundle)
+    try:
+        if args.reference_input and bundle.references:
+            raise ModelToolError("BUNDLE_REFERENCE_AMBIGUOUS",
+                                 "use reference_inputs in bundle.json or --reference-input, not both")
+        args.model = str(bundle.model)
+        args.metadata = str(bundle.metadata) if bundle.metadata else args.metadata
+        args.model_profile = str(bundle.profile) if bundle.profile else args.model_profile
+        args.model_loader = str(bundle.loader) if bundle.loader else args.model_loader
+        if bundle.references:
+            args.reference_input = bundle.references
+        if not args.output_dir:
+            args.output_dir = str(Path("dist") / bundle.manifest["bundle_id"])
+        args.quiet = True
+        build = cmd_build(args)
+        output = path(args.package_output) if args.package_output else \
+            path(args.output_dir) / f"{bundle.manifest['bundle_id']}-{args.target}.tar.gz"
+        if output.exists() and args.force:
+            output.unlink()
+        archive = create_delivery_package(bundle=bundle,
+                                          build_root=path(args.output_dir), output=output)
+        print(json.dumps({**build, "bundle_id": bundle.manifest["bundle_id"],
+                          "package": str(archive), "provenance": bundle.provenance()}, indent=2))
+    finally:
+        bundle.cleanup()
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
@@ -347,6 +397,25 @@ def add_common(parser: argparse.ArgumentParser) -> None:
                         help="Trusted loader.py exposing load_model(path) or build_model()")
 
 
+def add_build_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--target", default="arm64")
+    parser.add_argument("--output-dir")
+    parser.add_argument("--tensorflow-root", default=str(Path.home() / "tensorflow"))
+    parser.add_argument("--aarch64-toolchain")
+    parser.add_argument("--aarch64-compiler",
+                        help="Cross GCC selected in the generated Bazel configuration")
+    parser.add_argument("--aarch64-toolchain-config")
+    parser.add_argument("--aarch64-staging-dir",
+                        help="OpenWrt/QSDK staging_dir passed to Bazel compile actions")
+    parser.add_argument("--target-libc", choices=["glibc", "musl"], default="glibc",
+                        help="C library ABI on the deployment target (default: glibc)")
+    parser.add_argument("--target-glibc", default="2.32",
+                        help="Maximum target GLIBC version; ignored for --target-libc musl")
+    parser.add_argument("--quantize", choices=["none", "int8", "float16"], default="none")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--allow-synthetic-validation", action="store_true")
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Build validated ARM64 TFLite model libraries")
     sub = root.add_subparsers(dest="command", required=True)
@@ -362,24 +431,17 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("validate", help="Validate an existing source/TFLite pair")
     p.add_argument("model"); p.add_argument("--tflite", required=True); p.add_argument("--output", required=True)
     add_common(p); p.set_defaults(func=cmd_validate)
+    p = sub.add_parser("inspect-bundle", help="Validate and describe a directory or ZIP model bundle")
+    p.add_argument("bundle", help="Bundle directory or .zip containing bundle.json")
+    p.set_defaults(func=cmd_inspect_bundle)
     p = sub.add_parser("build", help="Convert, validate, package and inspect one ARM64 .so")
-    p.add_argument("model"); p.add_argument("--target", default="arm64")
-    p.add_argument("--output-dir")
-    p.add_argument("--tensorflow-root", default=str(Path.home() / "tensorflow"))
-    p.add_argument("--aarch64-toolchain")
-    p.add_argument("--aarch64-compiler",
-                   help="Cross GCC selected in the generated Bazel configuration")
-    p.add_argument("--aarch64-toolchain-config")
-    p.add_argument("--aarch64-staging-dir",
-                   help="OpenWrt/QSDK staging_dir passed to Bazel compile actions")
-    p.add_argument("--target-libc", choices=["glibc", "musl"], default="glibc",
-                   help="C library ABI on the deployment target (default: glibc)")
-    p.add_argument("--target-glibc", default="2.32",
-                   help="Maximum target GLIBC version; ignored for --target-libc musl")
-    p.add_argument("--quantize", choices=["none", "int8", "float16"], default="none")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--allow-synthetic-validation", action="store_true")
+    p.add_argument("model")
+    add_build_arguments(p)
     add_common(p); p.set_defaults(func=cmd_build)
+    p = sub.add_parser("build-package", help="Validate a model bundle, build ARM64 .so and create .tar.gz")
+    p.add_argument("bundle", help="Bundle directory or .zip containing bundle.json")
+    p.add_argument("--package-output", help="Output .tar.gz; default: inside --output-dir")
+    add_build_arguments(p); add_common(p); p.set_defaults(func=cmd_build_package)
     return root
 
 
